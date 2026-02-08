@@ -1,6 +1,6 @@
 # swu-go
 
-纯 Go 实现的 VoWiFi/SWu 客户端库，用于建立到 ePDG (Evolved Packet Data Gateway) 的 IPSec 隧道。
+纯 Go 实现的 SWu 客户端库，用于建立到 ePDG (Evolved Packet Data Gateway) 的 IPSec 隧道。
 
 ## 功能特性
 
