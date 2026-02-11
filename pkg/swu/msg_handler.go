@@ -17,7 +17,10 @@ func (s *Session) decryptAndParse(data []byte) (uint32, []ikev2.Payload, error) 
 
 	if header.NextPayload != ikev2.SK {
 		packet, err := ikev2.DecodePacket(data)
-		return header.MessageID, packet.Payloads, err
+		if err != nil || packet == nil {
+			return header.MessageID, nil, err
+		}
+		return header.MessageID, packet.Payloads, nil
 	}
 
 	// 处理 SK 载荷
