@@ -616,7 +616,7 @@ func (s *Session) startDataPlaneLoop() {
 
 			espSendCount++
 			if espSendCount <= 10 || espSendCount%100 == 0 {
-				logger.Info("ESP 已发送",
+				logger.Debug("ESP 已发送",
 					logger.Uint64("count", espSendCount),
 					logger.String("dstIP", dstIP),
 					logger.Int("proto", int(proto)),
