@@ -1,8 +1,10 @@
 package driver
 
 import (
+	"errors"
 	"fmt"
 	"net"
+	"syscall"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -179,8 +181,12 @@ func (n *NetTools) AddRoute(cidr string, gw string, iface string) error {
 		}
 		route.LinkIndex = link.Attrs().Index
 	}
-
-	return wrapErr("route add", cidr, netlink.RouteAdd(route))
+	// 忽略路由已存在错误（多设备可能共享 P-CSCF 等目标地址）
+	err = netlink.RouteAdd(route)
+	if err != nil && isRouteExists(err) {
+		return nil
+	}
+	return wrapErr("route add", cidr, err)
 }
 
 // DelRoute 删除 IPv4 路由
@@ -205,8 +211,12 @@ func (n *NetTools) DelRoute(cidr string, gw string, iface string) error {
 		}
 		route.LinkIndex = link.Attrs().Index
 	}
-
-	return wrapErr("route del", cidr, netlink.RouteDel(route))
+	// 忽略路由不存在错误（可能已被其他设备会话删除）
+	err = netlink.RouteDel(route)
+	if err != nil && isRouteNotFound(err) {
+		return nil
+	}
+	return wrapErr("route del", cidr, err)
 }
 
 // AddRoute6 添加 IPv6 路由
@@ -217,4 +227,22 @@ func (n *NetTools) AddRoute6(cidr string, gw string, iface string) error {
 // DelRoute6 删除 IPv6 路由
 func (n *NetTools) DelRoute6(cidr string, gw string, iface string) error {
 	return n.DelRoute(cidr, gw, iface)
+}
+
+// isRouteExists 判断是否为路由已存在错误 (EEXIST)
+func isRouteExists(err error) bool {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno == syscall.EEXIST
+	}
+	return false
+}
+
+// isRouteNotFound 判断是否为路由不存在错误 (ESRCH)
+func isRouteNotFound(err error) bool {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno == syscall.ESRCH
+	}
+	return false
 }
