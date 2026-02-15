@@ -52,6 +52,11 @@ func getLink(iface string) (netlink.Link, error) {
 	return link, nil
 }
 
+// GetLink 根据接口名获取 Link 对象（导出方法）
+func (n *NetTools) GetLink(iface string) (netlink.Link, error) {
+	return getLink(iface)
+}
+
 // SetLinkUp 启用网络接口
 func (n *NetTools) SetLinkUp(iface string) error {
 	link, err := getLink(iface)
@@ -245,4 +250,156 @@ func isRouteNotFound(err error) bool {
 		return errno == syscall.ESRCH
 	}
 	return false
+}
+
+// isRuleExists 判断是否为规则已存在错误 (EEXIST)
+func isRuleExists(err error) bool {
+	return isRouteExists(err)
+}
+
+// AddRouteTable 在指定路由表中添加路由（用于策略路由）
+func (n *NetTools) AddRouteTable(cidr string, iface string, table int) error {
+	_, dst, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return wrapErr("route add table", cidr, fmt.Errorf("解析目标地址失败: %v", err))
+	}
+
+	route := &netlink.Route{
+		Dst:   dst,
+		Table: table,
+	}
+
+	if iface != "" {
+		link, err := getLink(iface)
+		if err != nil {
+			return wrapErr("route add table", cidr, err)
+		}
+		route.LinkIndex = link.Attrs().Index
+	}
+
+	// 忽略路由已存在错误
+	err = netlink.RouteAdd(route)
+	if err != nil && isRouteExists(err) {
+		return nil
+	}
+	return wrapErr("route add table", cidr, err)
+}
+
+// DelRouteTable 从指定路由表中删除路由
+func (n *NetTools) DelRouteTable(cidr string, iface string, table int) error {
+	_, dst, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return wrapErr("route del table", cidr, fmt.Errorf("解析目标地址失败: %v", err))
+	}
+
+	route := &netlink.Route{
+		Dst:   dst,
+		Table: table,
+	}
+
+	if iface != "" {
+		link, err := getLink(iface)
+		if err != nil {
+			return wrapErr("route del table", cidr, err)
+		}
+		route.LinkIndex = link.Attrs().Index
+	}
+
+	// 忽略路由不存在错误
+	err = netlink.RouteDel(route)
+	if err != nil && isRouteNotFound(err) {
+		return nil
+	}
+	return wrapErr("route del table", cidr, err)
+}
+
+// AddRule 添加策略路由规则：from <srcCIDR> lookup <table>
+func (n *NetTools) AddRule(srcCIDR string, table int) error {
+	_, src, err := net.ParseCIDR(srcCIDR)
+	if err != nil {
+		return wrapErr("rule add", srcCIDR, fmt.Errorf("解析源地址失败: %v", err))
+	}
+
+	rule := netlink.NewRule()
+	rule.Src = src
+	rule.Table = table
+
+	// 清理旧规则 (防止 Table ID 变更导致残留规则指向无效表)
+	// 查找所有源地址匹配的规则并删除
+	family := netlink.FAMILY_V4
+	if src.IP.To4() == nil {
+		family = netlink.FAMILY_V6
+	}
+	if rules, err := netlink.RuleList(family); err == nil {
+		for _, r := range rules {
+			if r.Src != nil && r.Src.String() == src.String() {
+				// 忽略错误，尽可能清理
+				_ = netlink.RuleDel(&r)
+			}
+		}
+	}
+
+	err = netlink.RuleAdd(rule)
+	if err != nil && isRuleExists(err) {
+		return nil
+	}
+	return wrapErr("rule add", fmt.Sprintf("from %s lookup %d", srcCIDR, table), err)
+}
+
+// DelRule 删除策略路由规则
+func (n *NetTools) DelRule(srcCIDR string, table int) error {
+	_, src, err := net.ParseCIDR(srcCIDR)
+	if err != nil {
+		return wrapErr("rule del", srcCIDR, fmt.Errorf("解析源地址失败: %v", err))
+	}
+
+	rule := netlink.NewRule()
+	rule.Src = src
+	rule.Table = table
+
+	// 忽略规则不存在错误
+	err = netlink.RuleDel(rule)
+	if err != nil && isRouteNotFound(err) {
+		return nil
+	}
+	return wrapErr("rule del", fmt.Sprintf("from %s lookup %d", srcCIDR, table), err)
+}
+
+// AddInputRule 添加基于入站接口的策略路由规则：iif <iface> lookup <table>
+func (n *NetTools) AddInputRule(iface string, table int) error {
+	rule := netlink.NewRule()
+	rule.IifName = iface
+	rule.Table = table
+
+	// 清理旧规则 (防止 Table ID 变更)
+	// 查找所有入站接口匹配的规则并删除 (IPv4/IPv6 都查)
+	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
+		if rules, err := netlink.RuleList(family); err == nil {
+			for _, r := range rules {
+				if r.IifName == iface {
+					_ = netlink.RuleDel(&r)
+				}
+			}
+		}
+	}
+
+	err := netlink.RuleAdd(rule)
+	if err != nil && isRuleExists(err) {
+		return nil
+	}
+	return wrapErr("rule add", fmt.Sprintf("iif %s lookup %d", iface, table), err)
+}
+
+// DelInputRule 删除基于入站接口的策略路由规则
+func (n *NetTools) DelInputRule(iface string, table int) error {
+	rule := netlink.NewRule()
+	rule.IifName = iface
+	rule.Table = table
+
+	// 忽略规则不存在错误
+	err := netlink.RuleDel(rule)
+	if err != nil && isRouteNotFound(err) {
+		return nil
+	}
+	return wrapErr("rule del", fmt.Sprintf("iif %s lookup %d", iface, table), err)
 }

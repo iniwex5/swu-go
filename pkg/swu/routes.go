@@ -20,6 +20,28 @@ func isFullIPv4Range(ts *ikev2.TrafficSelector) bool {
 	return binary.BigEndian.Uint32(ts.StartAddr) == 0 && binary.BigEndian.Uint32(ts.EndAddr) == 0xffffffff
 }
 
+func isFullIPv6Range(ts *ikev2.TrafficSelector) bool {
+	if ts == nil || ts.TSType != ikev2.TS_IPV6_ADDR_RANGE {
+		return false
+	}
+	if len(ts.StartAddr) != 16 || len(ts.EndAddr) != 16 {
+		return false
+	}
+	// StartAddr == :: (all zeros)
+	// EndAddr == ffff... (all ones)
+	for _, b := range ts.StartAddr {
+		if b != 0 {
+			return false
+		}
+	}
+	for _, b := range ts.EndAddr {
+		if b != 0xff {
+			return false
+		}
+	}
+	return true
+}
+
 func ipv4RangeToCIDRs(start, end net.IP) ([]string, error) {
 	s := start.To4()
 	e := end.To4()

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os/exec"
 	"sync"
 	"time"
 
@@ -478,6 +479,11 @@ type netToolsDeleter interface {
 }
 
 func (s *Session) applyNetworkConfigOnTUN(iface string) error {
+	logger.Debug("Applying network config on TUN", logger.String("iface", iface), logger.Bool("has_driver", s.net != nil))
+
+	if s.net == nil {
+		return nil
+	}
 	deleter, _ := s.net.(netToolsDeleter)
 
 	if s.cpConfig != nil {
@@ -522,22 +528,154 @@ func (s *Session) applyNetworkConfigOnTUN(iface string) error {
 		}
 	}
 
+	// 检查是否支持策略路由
+	// 如果支持，我们允许添加 0.0.0.0/0 默认路由（因为它会被隔离在独立的路由表中）
+	// 如果不支持，我们需要跳过默认路由，防止覆盖宿主机的默认网关
+	type policyRouter interface {
+		AddRouteTable(cidr string, iface string, table int) error
+		DelRouteTable(cidr string, iface string, table int) error
+		AddRule(srcCIDR string, table int) error
+		DelRule(srcCIDR string, table int) error
+		AddInputRule(iface string, table int) error
+		DelInputRule(iface string, table int) error
+	}
+	_, enablePolicyRouting := s.net.(policyRouter)
+
 	for _, ts := range s.tsr {
-		if ts.TSType != ikev2.TS_IPV4_ADDR_RANGE {
+		if ts.TSType != ikev2.TS_IPV4_ADDR_RANGE && ts.TSType != ikev2.TS_IPV6_ADDR_RANGE {
 			continue
 		}
-		if isFullIPv4Range(ts) {
-			continue
+
+		// IPv4 处理
+		if ts.TSType == ikev2.TS_IPV4_ADDR_RANGE {
+			// 如果不支持策略路由，且是全网段，则跳过 (保护宿主机)
+			if !enablePolicyRouting && isFullIPv4Range(ts) {
+				logger.Debug("Skipping full range IPv4 TS to protect host default gateway", logger.String("start", net.IP(ts.StartAddr).String()))
+				continue
+			}
+
+			// 如果是全网段，直接添加 0.0.0.0/0
+			if isFullIPv4Range(ts) {
+				logger.Debug("PolicyRouting: Adding default IPv4 route (0.0.0.0/0)", logger.Int("table", 0)) // table ID not avail here, just info
+				routes = append(routes, "0.0.0.0/0")
+				continue
+			}
+
+			start := net.IP(ts.StartAddr)
+			end := net.IP(ts.EndAddr)
+			cidrs, err := ipv4RangeToCIDRs(start, end)
+			if err != nil {
+				continue
+			}
+			routes = append(routes, cidrs...)
 		}
-		start := net.IP(ts.StartAddr)
-		end := net.IP(ts.EndAddr)
-		cidrs, err := ipv4RangeToCIDRs(start, end)
-		if err != nil {
-			continue
+
+		// IPv6 处理
+		if ts.TSType == ikev2.TS_IPV6_ADDR_RANGE {
+			// 如果不支持策略路由，且是全网段，则跳过
+			if !enablePolicyRouting && isFullIPv6Range(ts) {
+				logger.Warn("Skipping full range IPv6 TS to protect host default gateway")
+				continue
+			}
+
+			// 如果是全网段，直接添加 ::/0
+			if isFullIPv6Range(ts) {
+				logger.Debug("PolicyRouting: Adding default IPv6 route (::/0)")
+				routes6 = append(routes6, "::/0")
+				continue
+			}
+
+			// 简单处理：如果是单个 IP
+			if len(ts.StartAddr) == 16 && len(ts.EndAddr) == 16 {
+				start := net.IP(ts.StartAddr)
+				end := net.IP(ts.EndAddr)
+				if start.Equal(end) {
+					routes6 = append(routes6, fmt.Sprintf("%s/128", start.String()))
+				} else {
+					// TODO: 完整的 IPv6 范围转 CIDR 比较复杂，暂时只支持全网段或单IP
+					// 如果不是全网段，我们暂不添加详细路由，或者等待后续完善
+					logger.Warn("Skipping complex IPv6 range", logger.String("start", start.String()), logger.String("end", end.String()))
+				}
+			}
 		}
-		routes = append(routes, cidrs...)
 	}
 
+	// 尝试使用策略路由（独立路由表），避免多设备共享 P-CSCF 等场景下路由冲突
+	if pr, ok := s.net.(policyRouter); ok {
+		enablePolicyRouting = true
+		logger.Info("Policy routing supported by driver", logger.String("iface", iface))
+		// 使用 TUN 接口的 link index 作为路由表 ID（避免与系统表冲突，加偏移 1000）
+		link, err := s.net.(*driver.NetTools).GetLink(iface)
+		if err == nil {
+			tableID := link.Attrs().Index + 1000
+
+			// 1. 添加基于入站接口 (iif) 的策略路由规则：iif <iface> lookup <tableID>
+			// 这解决了 RPF (反向路径过滤) 问题：确保入站包能匹配到正确的路由表
+			if err := pr.AddInputRule(iface, tableID); err != nil {
+				return err
+			}
+			tbl := tableID
+			s.netUndos = append(s.netUndos, func() error { return pr.DelInputRule(iface, tbl) })
+
+			// 2. 添加基于源地址的策略路由规则：from <设备IP> lookup <tableID>
+			var srcCIDRs []string
+			if s.cpConfig != nil {
+				for _, ip := range s.cpConfig.IPv4Addresses {
+					if v4 := ip.To4(); v4 != nil {
+						srcCIDRs = append(srcCIDRs, fmt.Sprintf("%s/32", v4.String()))
+					}
+				}
+				for _, ip := range s.cpConfig.IPv6Addresses {
+					if v6 := ip.To16(); v6 != nil {
+						srcCIDRs = append(srcCIDRs, fmt.Sprintf("%s/128", v6.String()))
+					}
+				}
+			}
+
+			// 先添加 ip rule
+			for _, src := range srcCIDRs {
+				if err := pr.AddRule(src, tableID); err != nil {
+					return err
+				}
+				srcCopy := src
+				tbl := tableID
+				s.netUndos = append(s.netUndos, func() error { return pr.DelRule(srcCopy, tbl) })
+			}
+
+			// 再添加路由到独立路由表
+			for _, cidr := range routes {
+				if err := pr.AddRouteTable(cidr, iface, tableID); err != nil {
+					return err
+				}
+				c := cidr
+				tbl := tableID
+				s.netUndos = append(s.netUndos, func() error { return pr.DelRouteTable(c, iface, tbl) })
+			}
+			for _, cidr := range routes6 {
+				if err := pr.AddRouteTable(cidr, iface, tableID); err != nil {
+					return err
+				}
+				c := cidr
+				tbl := tableID
+				s.netUndos = append(s.netUndos, func() error { return pr.DelRouteTable(c, iface, tbl) })
+			}
+
+			// [自检] 打印路由规则以诊断残留问题
+			go func(tid int) {
+				time.Sleep(1 * time.Second) // 稍等规则生效
+				if out, err := exec.Command("ip", "rule", "show").CombinedOutput(); err == nil {
+					logger.Info("策略路由规则快照", logger.String("rules", string(out)))
+				}
+				if out, err := exec.Command("ip", "route", "show", "table", fmt.Sprintf("%d", tid)).CombinedOutput(); err == nil {
+					logger.Info("路由表快照", logger.Int("table", tid), logger.String("routes", string(out)))
+				}
+			}(tableID)
+
+			return nil
+		}
+	}
+
+	// 回退：使用默认路由表（单设备场景或不支持策略路由时）
 	for _, cidr := range routes {
 		if err := s.net.AddRoute(cidr, "", iface); err != nil {
 			return err
