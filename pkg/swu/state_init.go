@@ -13,7 +13,6 @@ import (
 
 	"github.com/iniwex5/swu-go/pkg/crypto"
 	"github.com/iniwex5/swu-go/pkg/ikev2"
-	"github.com/iniwex5/swu-go/pkg/logger"
 )
 
 func detectOutboundIPv4(remoteIP net.IP, remotePort uint16) (net.IP, error) {
@@ -267,7 +266,7 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 				setter.SetRemotePort(4500)
 			}
 			s.startNATKeepalive(20 * time.Second)
-			logger.Info("检测到 NAT，切换到 UDP 4500")
+			s.Logger.Info("检测到 NAT，切换到 UDP 4500")
 		}
 	}
 
@@ -322,7 +321,7 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 	}
 
 	// 计算密钥
-	logger.Debug("正在生成密钥材料")
+	s.Logger.Debug("正在生成密钥材料")
 	if err := s.GenerateIKESAKeys(s.nr); err != nil {
 		return err
 	}

@@ -15,6 +15,7 @@ import (
 	"github.com/iniwex5/swu-go/pkg/ikev2"
 	"github.com/iniwex5/swu-go/pkg/ipsec"
 	"github.com/iniwex5/swu-go/pkg/logger"
+	"go.uber.org/zap"
 )
 
 type Session struct {
@@ -82,6 +83,8 @@ type Session struct {
 	retryCtx *RetryContext
 
 	ws *WiresharkDebugger
+
+	Logger *zap.Logger
 }
 
 type ikeWaitKey struct {
@@ -94,7 +97,12 @@ type childOutPolicy struct {
 	tsr   []*ikev2.TrafficSelector
 }
 
-func NewSession(cfg *Config) *Session {
+func NewSession(cfg *Config, l *zap.Logger) *Session {
+	if l == nil {
+		l = logger.Get() // Fallback to global logger if nil provided
+		l.Warn("NewSession received nil logger, falling back to global logger")
+	}
+
 	// 生成随机 SPIi
 	spiBytes, _ := crypto.RandomBytes(8)
 	spii := binary.BigEndian.Uint64(spiBytes)
@@ -105,13 +113,15 @@ func NewSession(cfg *Config) *Session {
 	}
 
 	return &Session{
-		cfg:            cfg,
-		net:            netTools,
-		SPIi:           spii,
-		SequenceNumber: 0,
-		ChildSAsIn:     make(map[uint32]*ipsec.SecurityAssociation),
-		ikeWaiters:     make(map[ikeWaitKey]chan []byte),
-		ikePending:     make(map[ikeWaitKey][]byte),
+		cfg:              cfg,
+		Logger:           l,
+		net:              netTools,
+		SPIi:             spii,
+		SequenceNumber:   0,
+		ChildSAsIn:       make(map[uint32]*ipsec.SecurityAssociation),
+		ikeWaiters:       make(map[ikeWaitKey]chan []byte),
+		ikePending:       make(map[ikeWaitKey][]byte),
+		childOutPolicies: make([]childOutPolicy, 0),
 	}
 }
 
@@ -150,11 +160,11 @@ func (s *Session) Connect(ctx context.Context) error {
 		LocalAddrString() string
 		RemoteAddrString() string
 	}); ok {
-		logger.Info("正在连接到 ePDG",
+		s.Logger.Info("正在连接到 ePDG",
 			logger.String("remote", sm.RemoteAddrString()),
 			logger.String("local", sm.LocalAddrString()))
 	} else {
-		logger.Info("正在连接到 ePDG", logger.String("addr", s.cfg.EpDGAddr))
+		s.Logger.Info("正在连接到 ePDG", logger.String("addr", s.cfg.EpDGAddr))
 	}
 
 	go s.logSessionStats(60 * time.Second)
@@ -184,7 +194,7 @@ func (s *Session) Connect(ctx context.Context) error {
 		break
 	}
 
-	logger.Info("IKE_SA_INIT 完成，密钥已生成")
+	s.Logger.Info("IKE_SA_INIT 完成，密钥已生成")
 	s.SequenceNumber = 1
 
 	s.ws, err = NewWiresharkDebugger(s.cfg.EnableWiresharkKeyLog, s.cfg.WiresharkKeyLogPath)
@@ -235,11 +245,11 @@ func (s *Session) Connect(ctx context.Context) error {
 			// 检查 AUTH (成功)
 			if _, ok := p.(*ikev2.EncryptedPayloadAuth); ok {
 				// EAP Success 通常随服务器的 AUTH 一起到来
-				logger.Info("收到 AUTH 载荷")
+				s.Logger.Info("收到 AUTH 载荷")
 			}
 			// 检查 CP (配置)
 			if _, ok := p.(*ikev2.EncryptedPayloadCP); ok {
-				logger.Info("收到配置载荷")
+				s.Logger.Info("收到配置载荷")
 				// 解析 IP 和 DNS
 			}
 		}
@@ -277,12 +287,12 @@ func (s *Session) Connect(ctx context.Context) error {
 			return fmt.Errorf("对端未返回 EAP 载荷(payloadTypes=%v)，无法继续 EAP-AKA", types)
 		}
 
-		logger.Info("握手循环完成")
+		s.Logger.Info("握手循环完成")
 		break
 	}
 
 	if err := s.handleIKEAuthFinalResp(respData); err != nil {
-		logger.Info("EAP 成功响应未完成 CHILD_SA，尝试发送最终 AUTH")
+		s.Logger.Info("EAP 成功响应未完成 CHILD_SA，尝试发送最终 AUTH")
 		finalPayloads, err := s.buildIKEAuthFinalPayloads()
 		if err != nil {
 			return fmt.Errorf("failed to build final AUTH: %v", err)
@@ -296,7 +306,7 @@ func (s *Session) Connect(ctx context.Context) error {
 		}
 	}
 
-	logger.Info("会话已建立", logger.Duration("handshake", time.Since(handshakeStart)))
+	s.Logger.Info("会话已建立", logger.Duration("handshake", time.Since(handshakeStart)))
 
 	// 4. 设置 IPSec 数据平面
 	if s.cfg.EnableDriver {
@@ -312,11 +322,11 @@ func (s *Session) Connect(ctx context.Context) error {
 
 	// 等待 context 取消 (优雅关闭)
 	<-s.ctx.Done()
-	logger.Info("收到关闭信号，正在清理")
+	s.Logger.Info("收到关闭信号，正在清理")
 
 	// 发送 IKE SA Delete 通知
 	if err := s.sendDeleteIKE(); err != nil {
-		logger.Warn("发送 Delete 通知失败", logger.Err(err))
+		s.Logger.Warn("发送 Delete 通知失败", logger.Err(err))
 	}
 
 	s.cleanupNetworkConfig()
@@ -327,7 +337,7 @@ func (s *Session) Connect(ctx context.Context) error {
 func (s *Session) cleanupNetworkConfig() {
 	for i := len(s.netUndos) - 1; i >= 0; i-- {
 		if err := s.netUndos[i](); err != nil {
-			logger.Warn("回滚网络配置失败", logger.Err(err))
+			s.Logger.Warn("回滚网络配置失败", logger.Err(err))
 		}
 	}
 	s.netUndos = nil
@@ -346,7 +356,7 @@ func (s *Session) logSessionStats(interval time.Duration) {
 			return
 		case <-ticker.C:
 			stats := s.retryCtx.Stats()
-			logger.Debug("会话统计",
+			s.Logger.Debug("会话统计",
 				logger.Uint64("spii", s.SPIi),
 				logger.Uint64("spir", s.SPIr),
 				logger.Uint64("attempts", stats.TotalAttempts),
@@ -357,7 +367,7 @@ func (s *Session) logSessionStats(interval time.Duration) {
 
 			if sm, ok := s.socket.(*ipsec.SocketManager); ok {
 				sockStats := sm.Stats()
-				logger.Debug("Socket 统计",
+				s.Logger.Debug("Socket 统计",
 					logger.Uint64("spii", s.SPIi),
 					logger.Uint64("spir", s.SPIr),
 					logger.Uint64("ikeRecv", sockStats.ReceivedIKE),
@@ -390,7 +400,7 @@ func (s *Session) startNATKeepalive(interval time.Duration) {
 				return
 			case <-ticker.C:
 				if err := sender.SendNATKeepalive(); err != nil {
-					logger.Debug("NAT keepalive 发送失败", logger.Err(err))
+					s.Logger.Debug("NAT keepalive 发送失败", logger.Err(err))
 				}
 			}
 		}
@@ -438,7 +448,7 @@ func (s *Session) setupDataPlane() error {
 		}
 		if mtu > 0 {
 			if err := tx.SetMTU(s.tun.DeviceName(), mtu); err != nil {
-				logger.Warn("设置 TUN MTU 失败，将继续", logger.String("iface", s.tun.DeviceName()), logger.Int("mtu", mtu), logger.Err(err))
+				s.Logger.Warn("设置 TUN MTU 失败，将继续", logger.String("iface", s.tun.DeviceName()), logger.Int("mtu", mtu), logger.Err(err))
 			}
 		}
 		tx.Commit()
@@ -457,7 +467,7 @@ func (s *Session) setupDataPlane() error {
 		}
 		if mtu > 0 {
 			if err := s.net.SetMTU(s.tun.DeviceName(), mtu); err != nil {
-				logger.Warn("设置 TUN MTU 失败，将继续", logger.String("iface", s.tun.DeviceName()), logger.Int("mtu", mtu), logger.Err(err))
+				s.Logger.Warn("设置 TUN MTU 失败，将继续", logger.String("iface", s.tun.DeviceName()), logger.Int("mtu", mtu), logger.Err(err))
 			}
 		}
 	}
@@ -479,7 +489,7 @@ type netToolsDeleter interface {
 }
 
 func (s *Session) applyNetworkConfigOnTUN(iface string) error {
-	logger.Debug("Applying network config on TUN", logger.String("iface", iface), logger.Bool("has_driver", s.net != nil))
+	s.Logger.Debug("Applying network config on TUN", logger.String("iface", iface), logger.Bool("has_driver", s.net != nil))
 
 	if s.net == nil {
 		return nil
@@ -550,13 +560,13 @@ func (s *Session) applyNetworkConfigOnTUN(iface string) error {
 		if ts.TSType == ikev2.TS_IPV4_ADDR_RANGE {
 			// 如果不支持策略路由，且是全网段，则跳过 (保护宿主机)
 			if !enablePolicyRouting && isFullIPv4Range(ts) {
-				logger.Debug("Skipping full range IPv4 TS to protect host default gateway", logger.String("start", net.IP(ts.StartAddr).String()))
+				s.Logger.Debug("Skipping full range IPv4 TS to protect host default gateway", logger.String("start", net.IP(ts.StartAddr).String()))
 				continue
 			}
 
 			// 如果是全网段，直接添加 0.0.0.0/0
 			if isFullIPv4Range(ts) {
-				logger.Debug("PolicyRouting: Adding default IPv4 route (0.0.0.0/0)", logger.Int("table", 0)) // table ID not avail here, just info
+				s.Logger.Debug("PolicyRouting: Adding default IPv4 route (0.0.0.0/0)", logger.Int("table", 0)) // table ID not avail here, just info
 				routes = append(routes, "0.0.0.0/0")
 				continue
 			}
@@ -574,13 +584,13 @@ func (s *Session) applyNetworkConfigOnTUN(iface string) error {
 		if ts.TSType == ikev2.TS_IPV6_ADDR_RANGE {
 			// 如果不支持策略路由，且是全网段，则跳过
 			if !enablePolicyRouting && isFullIPv6Range(ts) {
-				logger.Warn("Skipping full range IPv6 TS to protect host default gateway")
+				s.Logger.Warn("Skipping full range IPv6 TS to protect host default gateway")
 				continue
 			}
 
 			// 如果是全网段，直接添加 ::/0
 			if isFullIPv6Range(ts) {
-				logger.Debug("PolicyRouting: Adding default IPv6 route (::/0)")
+				s.Logger.Debug("PolicyRouting: Adding default IPv6 route (::/0)")
 				routes6 = append(routes6, "::/0")
 				continue
 			}
@@ -594,7 +604,7 @@ func (s *Session) applyNetworkConfigOnTUN(iface string) error {
 				} else {
 					// TODO: 完整的 IPv6 范围转 CIDR 比较复杂，暂时只支持全网段或单IP
 					// 如果不是全网段，我们暂不添加详细路由，或者等待后续完善
-					logger.Warn("Skipping complex IPv6 range", logger.String("start", start.String()), logger.String("end", end.String()))
+					s.Logger.Warn("Skipping complex IPv6 range", logger.String("start", start.String()), logger.String("end", end.String()))
 				}
 			}
 		}
@@ -603,7 +613,7 @@ func (s *Session) applyNetworkConfigOnTUN(iface string) error {
 	// 尝试使用策略路由（独立路由表），避免多设备共享 P-CSCF 等场景下路由冲突
 	if pr, ok := s.net.(policyRouter); ok {
 		enablePolicyRouting = true
-		logger.Info("Policy routing supported by driver", logger.String("iface", iface))
+		s.Logger.Info("Policy routing supported by driver", logger.String("iface", iface))
 		// 使用 TUN 接口的 link index 作为路由表 ID（避免与系统表冲突，加偏移 1000）
 		link, err := s.net.(*driver.NetTools).GetLink(iface)
 		if err == nil {
@@ -664,10 +674,10 @@ func (s *Session) applyNetworkConfigOnTUN(iface string) error {
 			go func(tid int) {
 				time.Sleep(1 * time.Second) // 稍等规则生效
 				if out, err := exec.Command("ip", "rule", "show").CombinedOutput(); err == nil {
-					logger.Info("策略路由规则快照", logger.String("rules", string(out)))
+					s.Logger.Info("策略路由规则快照", logger.String("rules", string(out)))
 				}
 				if out, err := exec.Command("ip", "route", "show", "table", fmt.Sprintf("%d", tid)).CombinedOutput(); err == nil {
-					logger.Info("路由表快照", logger.Int("table", tid), logger.String("routes", string(out)))
+					s.Logger.Info("路由表快照", logger.Int("table", tid), logger.String("routes", string(out)))
 				}
 			}(tableID)
 
@@ -698,17 +708,17 @@ func (s *Session) applyNetworkConfigOnTUN(iface string) error {
 }
 
 func (s *Session) startDataPlaneLoop() {
-	logger.Info("ESP 数据平面循环启动", logger.String("tun", s.tun.DeviceName()))
+	s.Logger.Info("ESP 数据平面循环启动", logger.String("tun", s.tun.DeviceName()))
 
 	// TUN -> ESP
 	go func() {
-		logger.Info("TUN->ESP goroutine 启动")
+		s.Logger.Info("TUN->ESP goroutine 启动")
 		buf := make([]byte, 2000)
 		var tunReadCount, espSendCount, saDropCount uint64
 		for {
 			n, err := s.tun.Read(buf)
 			if err != nil {
-				logger.Info("TUN 读取结束", logger.Err(err))
+				s.Logger.Info("TUN 读取结束", logger.Err(err))
 				break
 			}
 			tunReadCount++
@@ -732,7 +742,7 @@ func (s *Session) startDataPlaneLoop() {
 			if saOut == nil {
 				saDropCount++
 				if saDropCount <= 5 || saDropCount%100 == 0 {
-					logger.Warn("ESP 出站 SA 为空，丢弃数据包",
+					s.Logger.Warn("ESP 出站 SA 为空，丢弃数据包",
 						logger.Uint64("dropCount", saDropCount),
 						logger.String("dstIP", dstIP),
 						logger.Int("proto", int(proto)),
@@ -743,18 +753,18 @@ func (s *Session) startDataPlaneLoop() {
 
 			espPacket, err := ipsec.Encapsulate(packet, saOut)
 			if err != nil {
-				logger.Warn("ESP 封装错误", logger.Err(err), logger.String("dstIP", dstIP))
+				s.Logger.Warn("ESP 封装错误", logger.Err(err), logger.String("dstIP", dstIP))
 				continue
 			}
 
 			if err := s.socket.SendESP(espPacket); err != nil {
-				logger.Warn("ESP 发送失败", logger.Err(err), logger.String("dstIP", dstIP))
+				s.Logger.Warn("ESP 发送失败", logger.Err(err), logger.String("dstIP", dstIP))
 				continue
 			}
 
 			espSendCount++
 			if espSendCount <= 10 || espSendCount%100 == 0 {
-				logger.Debug("ESP 已发送",
+				s.Logger.Debug("ESP 已发送",
 					logger.Uint64("count", espSendCount),
 					logger.String("dstIP", dstIP),
 					logger.Int("proto", int(proto)),
@@ -763,7 +773,7 @@ func (s *Session) startDataPlaneLoop() {
 					logger.Uint32("spi", saOut.SPI))
 			}
 		}
-		logger.Info("TUN->ESP 循环退出", logger.Uint64("tunRead", tunReadCount), logger.Uint64("espSend", espSendCount), logger.Uint64("saDrop", saDropCount))
+		s.Logger.Info("TUN->ESP 循环退出", logger.Uint64("tunRead", tunReadCount), logger.Uint64("espSend", espSendCount), logger.Uint64("saDrop", saDropCount))
 	}()
 
 	// ESP -> TUN
@@ -785,13 +795,13 @@ func (s *Session) startDataPlaneLoop() {
 			}
 
 			if sa == nil {
-				logger.Warn("ESP 入站 SA 为空，丢弃数据包", logger.Uint32("spi", spi), logger.Int("len", len(espData)))
+				s.Logger.Warn("ESP 入站 SA 为空，丢弃数据包", logger.Uint32("spi", spi), logger.Int("len", len(espData)))
 				continue
 			}
 
 			packet, err := ipsec.Decapsulate(espData, sa)
 			if err != nil {
-				logger.Warn("ESP 解封装错误", logger.Err(err), logger.Uint32("spi", spi), logger.Int("len", len(espData)))
+				s.Logger.Warn("ESP 解封装错误", logger.Err(err), logger.Uint32("spi", spi), logger.Int("len", len(espData)))
 				continue
 			}
 

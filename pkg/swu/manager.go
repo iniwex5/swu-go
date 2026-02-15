@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/iniwex5/swu-go/pkg/logger"
+	"go.uber.org/zap"
 )
 
 type SessionManager struct {
@@ -33,7 +34,9 @@ func (m *SessionManager) Start(ctx context.Context, id string, cfg *Config) (*Se
 		return nil, errors.New("session id 已存在")
 	}
 
-	s := NewSession(cfg)
+	// 创建带设备 ID 的 logger
+	devLogger := logger.With(zap.String("device", id))
+	s := NewSession(cfg, devLogger)
 	sessCtx, cancel := context.WithCancel(ctx)
 	m.sessions[id] = s
 	m.cancels[id] = cancel

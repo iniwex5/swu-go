@@ -18,7 +18,7 @@ func (s *Session) RekeyChildSA() error {
 		return errors.New("没有活动的 CHILD_SA 可以 Rekey")
 	}
 
-	logger.Info("开始 CHILD_SA Rekey")
+	s.Logger.Info("开始 CHILD_SA Rekey")
 
 	// 1. 生成新的 Nonce
 	newNonce, err := crypto.RandomBytes(32)
@@ -168,12 +168,12 @@ func (s *Session) handleCreateChildSAResp(data []byte, niNonce []byte, newSPI ui
 		s.ws.LogChildSA(newSPI, respSPI, s.cfg.LocalAddr, s.cfg.EpDGAddr, keyMat[keyLen+saltLen:2*(keyLen+saltLen)], keyMat[0:keyLen+saltLen], encrID)
 	}
 
-	logger.Info("CHILD_SA Rekey 成功", logger.Uint32("oldSPI", oldOutSPI), logger.Uint32("newSPI", newSPI))
+	s.Logger.Info("CHILD_SA Rekey 成功", logger.Uint32("oldSPI", oldOutSPI), logger.Uint32("newSPI", newSPI))
 
 	// 12. 发送删除旧 SA 的通知 (可选但推荐)
 	go func() {
 		if err := s.sendDeleteChildSA([]uint32{oldOutSPI}); err != nil {
-			logger.Warn("发送旧 Child SA Delete 通知失败", logger.Err(err))
+			s.Logger.Warn("发送旧 Child SA Delete 通知失败", logger.Err(err))
 		}
 	}()
 
@@ -183,6 +183,6 @@ func (s *Session) handleCreateChildSAResp(data []byte, niNonce []byte, newSPI ui
 // RekeyIKESA 执行 IKE SA 密钥轮换
 // 这比 CHILD_SA Rekey 更复杂，需要重新协商 IKE SA
 func (s *Session) RekeyIKESA() error {
-	logger.Warn("IKE SA Rekey 目前不支持")
+	s.Logger.Warn("IKE SA Rekey 目前不支持")
 	return errors.New("IKE SA Rekey 尚未实现")
 }

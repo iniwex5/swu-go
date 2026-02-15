@@ -71,11 +71,11 @@ func (s *Session) ikeDispatchLoop() {
 			switch hdr.ExchangeType {
 			case ikev2.INFORMATIONAL:
 				if err := s.handleIncomingInformational(data); err != nil {
-					logger.Warn("处理 INFORMATIONAL 失败", logger.Err(err))
+					s.Logger.Warn("处理 INFORMATIONAL 失败", logger.Err(err))
 				}
 			case ikev2.CREATE_CHILD_SA:
 				if err := s.handleIncomingCreateChildSA(data); err != nil {
-					logger.Warn("处理 CREATE_CHILD_SA 失败", logger.Err(err))
+					s.Logger.Warn("处理 CREATE_CHILD_SA 失败", logger.Err(err))
 				}
 			}
 		}
