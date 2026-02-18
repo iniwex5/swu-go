@@ -167,11 +167,11 @@ func (s *Session) Connect(ctx context.Context) error {
 		LocalAddrString() string
 		RemoteAddrString() string
 	}); ok {
-		s.Logger.Info("正在连接到 ePDG",
+		s.Logger.Debug("正在连接到 ePDG",
 			logger.String("remote", sm.RemoteAddrString()),
 			logger.String("local", sm.LocalAddrString()))
 	} else {
-		s.Logger.Info("正在连接到 ePDG", logger.String("addr", s.cfg.EpDGAddr))
+		s.Logger.Debug("正在连接到 ePDG", logger.String("addr", s.cfg.EpDGAddr))
 	}
 
 	go s.logSessionStats(60 * time.Second)
@@ -201,7 +201,7 @@ func (s *Session) Connect(ctx context.Context) error {
 		break
 	}
 
-	s.Logger.Info("IKE_SA_INIT 完成，密钥已生成")
+	s.Logger.Debug("IKE_SA_INIT 完成，密钥已生成")
 	s.SequenceNumber = 1
 
 	s.ws, err = NewWiresharkDebugger(s.cfg.EnableWiresharkKeyLog, s.cfg.WiresharkKeyLogPath)
@@ -252,11 +252,11 @@ func (s *Session) Connect(ctx context.Context) error {
 			// 检查 AUTH (成功)
 			if _, ok := p.(*ikev2.EncryptedPayloadAuth); ok {
 				// EAP Success 通常随服务器的 AUTH 一起到来
-				s.Logger.Info("收到 AUTH 载荷")
+				s.Logger.Debug("收到 AUTH 载荷")
 			}
 			// 检查 CP (配置)
 			if _, ok := p.(*ikev2.EncryptedPayloadCP); ok {
-				s.Logger.Info("收到配置载荷")
+				s.Logger.Debug("收到配置载荷")
 				// 解析 IP 和 DNS
 			}
 		}
@@ -294,12 +294,12 @@ func (s *Session) Connect(ctx context.Context) error {
 			return fmt.Errorf("对端未返回 EAP 载荷(payloadTypes=%v)，无法继续 EAP-AKA", types)
 		}
 
-		s.Logger.Info("握手循环完成")
+		s.Logger.Debug("握手循环完成")
 		break
 	}
 
 	if err := s.handleIKEAuthFinalResp(respData); err != nil {
-		s.Logger.Info("EAP 成功响应未完成 CHILD_SA，尝试发送最终 AUTH")
+		s.Logger.Debug("EAP 成功响应未完成 CHILD_SA，尝试发送最终 AUTH")
 		finalPayloads, err := s.buildIKEAuthFinalPayloads()
 		if err != nil {
 			return fmt.Errorf("failed to build final AUTH: %v", err)
@@ -360,7 +360,7 @@ func (s *Session) WaitDone() {
 }
 
 func (s *Session) cleanupNetworkConfig() {
-	s.Logger.Info("开始清理网络配置", logger.Int("count", len(s.netUndos)))
+	s.Logger.Debug("开始清理网络配置", logger.Int("count", len(s.netUndos)))
 	for i := len(s.netUndos) - 1; i >= 0; i-- {
 		s.Logger.Debug("执行清理操作", logger.Int("index", i))
 		if err := s.netUndos[i](); err != nil {
@@ -512,7 +512,7 @@ func (s *Session) setupDataPlane() error {
 // setupXFRMDataPlane 配置 XFRM 模式的数据平面
 // 创建 XFRM Interface、安装 SA 和 SP，配置 ESP-in-UDP 封装
 func (s *Session) setupXFRMDataPlane() error {
-	s.Logger.Info("设置 XFRMI 数据平面")
+	s.Logger.Debug("设置 XFRMI 数据平面")
 
 	xfrmMgr := driver.NewXFRMManager()
 	s.xfrmMgr = xfrmMgr
@@ -535,14 +535,14 @@ func (s *Session) setupXFRMDataPlane() error {
 
 		// 如果绑定的是 0.0.0.0，需要探测实际出口 IP 用于 SA Src
 		if localIP.IsUnspecified() {
-			s.Logger.Info("LocalIP 未指定 (0.0.0.0)，尝试探测实际出口 IP", logger.String("remote", s.cfg.EpDGAddr))
+			s.Logger.Debug("LocalIP 未指定 (0.0.0.0)，尝试探测实际出口 IP", logger.String("remote", s.cfg.EpDGAddr))
 			// 使用 UDP 探测路由出口 IP
 			addr := net.JoinHostPort(s.cfg.EpDGAddr, fmt.Sprintf("%d", remotePort))
 			conn, err := net.Dial("udp", addr)
 			if err == nil {
 				localIP = conn.LocalAddr().(*net.UDPAddr).IP
 				conn.Close()
-				s.Logger.Info("探测到实际出口 IP", logger.String("ip", localIP.String()))
+				s.Logger.Debug("探测到实际出口 IP", logger.String("ip", localIP.String()))
 			} else {
 				s.Logger.Warn("探测实际出口 IP 失败，将使用 0.0.0.0 (可能导致 XFRM 封装失败)", logger.Err(err))
 			}
@@ -565,11 +565,6 @@ func (s *Session) setupXFRMDataPlane() error {
 		}
 	}
 
-	// [前置清理] 参考 strongswan 的策略跟踪表机制，清理可能残留的旧 SA/SP
-	// 防止上一次连接的状态污染导致 file exists 或策略不匹配
-	s.Logger.Info("前置清理：Flush 旧 XFRM State 和 Policy")
-	xfrmMgr.FlushAll()
-
 	// 查找 Underlying Interface (物理接口)
 	// XFRMI 接口最好绑定到底层物理接口，以便内核正确关联流量，避免 TX Error
 	var underlyingIdx int
@@ -582,7 +577,7 @@ func (s *Session) setupXFRMDataPlane() error {
 						if ipnet, ok := addr.(*net.IPNet); ok {
 							if ipnet.IP.Equal(localIP) {
 								underlyingIdx = iface.Index
-								s.Logger.Info("绑定底层物理接口", logger.String("iface", iface.Name), logger.Int("idx", iface.Index))
+								s.Logger.Debug("绑定底层物理接口", logger.String("iface", iface.Name), logger.Int("idx", iface.Index))
 								break
 							}
 						}
@@ -693,7 +688,7 @@ func (s *Session) setupXFRMDataPlane() error {
 		return xfrmMgr.DelSA(inSACfg.SPI, inSACfg.Src, inSACfg.Dst, inSACfg.Proto)
 	})
 
-	s.Logger.Info("XFRM SA 已安装",
+	s.Logger.Debug("XFRM SA 已安装",
 		logger.Uint32("outSPI", outSACfg.SPI),
 		logger.Uint32("inSPI", inSACfg.SPI),
 		logger.String("local", localIP.String()),
@@ -783,7 +778,7 @@ func (s *Session) setupXFRMDataPlane() error {
 		s.netUndos = append(s.netUndos, func() error { return xfrmMgr.DelSP(inSP6) })
 	}
 
-	s.Logger.Info("XFRM SP 已安装")
+	s.Logger.Debug("XFRM SP 已安装")
 
 	// 7. 在 XFRM 接口上配置 IP 地址和路由
 	// 复用 applyNetworkConfigOnTUN (它只依赖接口名)

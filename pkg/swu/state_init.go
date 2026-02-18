@@ -266,7 +266,7 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 				setter.SetRemotePort(4500)
 			}
 			s.startNATKeepalive(20 * time.Second)
-			s.Logger.Info("检测到 NAT，切换到 UDP 4500")
+			s.Logger.Debug("检测到 NAT，切换到 UDP 4500")
 		}
 	}
 

@@ -17,7 +17,7 @@ func (s *Session) sendDPD() error {
 
 // sendDeleteIKE 发送 IKE SA 删除通知
 func (s *Session) sendDeleteIKE() error {
-	s.Logger.Info("发送 IKE SA Delete 通知")
+	s.Logger.Debug("发送 IKE SA Delete 通知")
 	del := &ikev2.EncryptedPayloadDelete{
 		ProtocolID: ikev2.ProtoIKE,
 		SPISize:    0,
@@ -33,7 +33,7 @@ func (s *Session) sendDeleteIKE() error {
 
 // sendDeleteChildSA 发送 Child SA 删除通知
 func (s *Session) sendDeleteChildSA(spis []uint32) error {
-	s.Logger.Info("发送 Child SA Delete 通知", logger.Int("count", len(spis)))
+	s.Logger.Debug("发送 Child SA Delete 通知", logger.Int("count", len(spis)))
 	if len(spis) == 0 {
 		return nil
 	}

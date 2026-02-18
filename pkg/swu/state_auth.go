@@ -139,7 +139,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 
 	if pkt.Code == eap.CodeSuccess {
 		// EAP 成功！
-		s.Logger.Info("收到 EAP Success")
+		s.Logger.Debug("收到 EAP Success")
 		// 在 IKE_AUTH 中，EAP Success 通常伴随着服务器的 AUTH 载荷。
 		// 这在 session.go 的循环中处理。
 		// 我们这里只返回 nil 以表示不需要 EAP 响应。
@@ -627,7 +627,7 @@ func (s *Session) handleIKEAuthFinalResp(data []byte) error {
 				}
 				types = append(types, int(a.Type))
 			}
-			s.Logger.Info("CP 属性类型", logger.Any("types", types))
+			s.Logger.Debug("CP 属性类型", logger.Any("types", types))
 		}
 		s.cpConfig = ikev2.ParseCPConfig(cpPayload)
 		if s.cpConfig != nil {
@@ -649,7 +649,7 @@ func (s *Session) handleIKEAuthFinalResp(data []byte) error {
 			if len(s.cpConfig.IPv6Addresses) > 0 && s.cpConfig.IPv6Addresses[0] != nil {
 				ipv6 = s.cpConfig.IPv6Addresses[0].String()
 			}
-			s.Logger.Info("CP 配置已下发",
+			s.Logger.Debug("CP 配置已下发",
 				logger.String("ipv4", ipv4),
 				logger.String("ipv6", ipv6),
 				logger.Int("dns_v4", len(s.cpConfig.IPv4DNS)),
@@ -671,6 +671,6 @@ func (s *Session) handleIKEAuthFinalResp(data []byte) error {
 		s.childOutPolicies = append(s.childOutPolicies, childOutPolicy{saOut: s.ChildSAOut, tsr: s.tsr})
 	}
 
-	s.Logger.Info("Child SA 已建立", logger.Uint32("localSPI", s.childSPI), logger.Uint32("remoteSPI", remoteSPI))
+	s.Logger.Debug("Child SA 已建立", logger.Uint32("localSPI", s.childSPI), logger.Uint32("remoteSPI", remoteSPI))
 	return nil
 }

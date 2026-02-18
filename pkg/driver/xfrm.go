@@ -3,7 +3,6 @@ package driver
 import (
 	"fmt"
 	"net"
-	"os"
 
 	"github.com/iniwex5/netlink"
 )
@@ -228,19 +227,13 @@ func (x *XFRMManager) AddSP(cfg XFRMSPConfig) error {
 			},
 		},
 	}
-	// 打印详细的 Policy 信息用于调试
-	// 打印详细的 Policy 信息用于调试
-	fmt.Printf("[DEBUG] AddSP(STDOUT): Dir=%v Src=%v Dst=%v Ifid=%d TmplSrc=%v TmplDst=%v SPI=0x%x\n",
-		cfg.Dir, cfg.Src, cfg.Dst, cfg.Ifid, cfg.TmplSrc, cfg.TmplDst, cfg.TmplSPI)
 
 	// 使用 Update 语义 (XFRM_MSG_UPDPOLICY)，参考 strongswan kernel_netlink_ipsec.c:3057
 	// 覆盖已存在的同名策略，避免残留策略导致 file exists 错误
 	if err := netlink.XfrmPolicyUpdate(policy); err != nil {
-		fmt.Fprintf(os.Stderr, "[WARN] AddSP (Update) Failed: %v\n", err)
 		return fmt.Errorf("添加/更新 XFRM SP (dir=%s src=%v dst=%v) 失败: %v",
 			cfg.Dir, cfg.Src, cfg.Dst, err)
 	}
-	fmt.Fprintf(os.Stderr, "[DEBUG] AddSP Success\n")
 
 	x.undos = append(x.undos, func() error {
 		return x.DelSP(cfg)
