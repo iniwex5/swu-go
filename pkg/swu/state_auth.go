@@ -609,6 +609,11 @@ func (s *Session) handleIKEAuthFinalResp(data []byte) error {
 		s.ChildSAsIn[s.childSPI] = s.ChildSAIn
 	}
 
+	// 保存 Child SA 算法 ID (供 XFRM 模式使用)
+	s.childEncrID = encrID
+	s.childIntegID = integID
+	s.childEncrKeyLenBits = encrKeyLenBits
+
 	if s.ws != nil {
 		s.ws.LogChildSA(s.childSPI, remoteSPI, s.cfg.LocalAddr, s.cfg.EpDGAddr, inEncKey, outEncKey, encrID)
 	}

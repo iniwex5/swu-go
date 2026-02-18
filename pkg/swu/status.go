@@ -20,12 +20,25 @@ type SessionSnapshot struct {
 func (s *Session) Snapshot() SessionSnapshot {
 	out := SessionSnapshot{}
 	out.Established = s.ChildSAIn != nil && s.ChildSAOut != nil
-	// 启用了数据平面驱动时，TUN 接口也必须就绪才算 Established
-	if out.Established && s.cfg.EnableDriver && s.tun == nil {
-		out.Established = false
-	}
-	if s.tun != nil {
-		out.TUNName = s.tun.DeviceName()
+	// 启用了数据平面驱动时
+	if s.cfg.EnableDriver {
+		if s.cfg.DataplaneMode == "xfrmi" {
+			if out.Established && s.xfrmMgr == nil {
+				out.Established = false
+			}
+			if s.xfrmMgr != nil {
+				out.TUNName = s.cfg.XFRMIfName
+			}
+		} else {
+			if out.Established && s.tun == nil {
+				out.Established = false
+			}
+			if s.tun != nil {
+				out.TUNName = s.tun.DeviceName()
+			}
+		}
+	} else {
+		// 无驱动模式下，只看 SA
 	}
 	if s.cpConfig != nil {
 		if len(s.cpConfig.IPv4Addresses) > 0 {

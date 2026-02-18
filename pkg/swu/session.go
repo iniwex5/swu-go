@@ -6,10 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os/exec"
+
 	"sync"
 	"time"
 
+	"github.com/iniwex5/netlink"
 	"github.com/iniwex5/swu-go/pkg/crypto"
 	"github.com/iniwex5/swu-go/pkg/driver"
 	"github.com/iniwex5/swu-go/pkg/ikev2"
@@ -45,8 +46,11 @@ type Session struct {
 	ChildSAOut *ipsec.SecurityAssociation
 	ChildSAsIn map[uint32]*ipsec.SecurityAssociation
 
-	childSPI uint32
-	childDH  *crypto.DiffieHellman
+	childSPI            uint32
+	childDH             *crypto.DiffieHellman
+	childEncrID         uint16 // Child SA 加密算法 ID (用于 XFRM 映射)
+	childIntegID        uint16 // Child SA 完整性算法 ID
+	childEncrKeyLenBits int    // Child SA 加密密钥位数
 
 	natKeepaliveStarted bool
 
@@ -54,6 +58,8 @@ type Session struct {
 	tsi      []*ikev2.TrafficSelector
 	tsr      []*ikev2.TrafficSelector
 	netUndos []func() error
+	xfrmMgr  *driver.XFRMManager // XFRMI 模式下的 XFRM 管理器
+	done     chan struct{}       // 清理完成信号（Run() 返回前关闭）
 
 	childOutPolicies []childOutPolicy
 
@@ -122,6 +128,7 @@ func NewSession(cfg *Config, l *zap.Logger) *Session {
 		ikeWaiters:       make(map[ikeWaitKey]chan []byte),
 		ikePending:       make(map[ikeWaitKey][]byte),
 		childOutPolicies: make([]childOutPolicy, 0),
+		done:             make(chan struct{}),
 	}
 }
 
@@ -309,13 +316,25 @@ func (s *Session) Connect(ctx context.Context) error {
 	s.Logger.Info("会话已建立", logger.Duration("handshake", time.Since(handshakeStart)))
 
 	// 4. 设置 IPSec 数据平面
-	if s.cfg.EnableDriver {
-		if err := s.setupDataPlane(); err != nil {
-			return err
-		}
+	// 强制启用 XFRMI 模式 (DEBUG FIX)
+	s.cfg.EnableDriver = true
+	s.cfg.DataplaneMode = "xfrmi"
 
-		// 启动数据循环
-		s.startDataPlaneLoop()
+	if s.cfg.EnableDriver {
+		if s.cfg.DataplaneMode == "xfrmi" {
+			// XFRMI 模式: 使用内核 XFRM offload
+			if err := s.setupXFRMDataPlane(); err != nil {
+				s.cleanupNetworkConfig()
+				return err
+			}
+			// XFRMI 模式不需要用户空间数据循环，内核自动处理 ESP 加解密
+		} else {
+			// TUN 模式: 用户空间 ESP 加解密
+			if err := s.setupDataPlane(); err != nil {
+				return err
+			}
+			s.startDataPlaneLoop()
+		}
 	}
 
 	s.startIKEControlLoop()
@@ -330,17 +349,26 @@ func (s *Session) Connect(ctx context.Context) error {
 	}
 
 	s.cleanupNetworkConfig()
+	close(s.done) // 通知外部清理已完成
 
 	return s.ctx.Err()
 }
 
+// WaitDone 阻塞等待 Session 清理完成（Run 返回前的 cleanup 执行完毕）
+func (s *Session) WaitDone() {
+	<-s.done
+}
+
 func (s *Session) cleanupNetworkConfig() {
+	s.Logger.Info("开始清理网络配置", logger.Int("count", len(s.netUndos)))
 	for i := len(s.netUndos) - 1; i >= 0; i-- {
+		s.Logger.Debug("执行清理操作", logger.Int("index", i))
 		if err := s.netUndos[i](); err != nil {
 			s.Logger.Warn("回滚网络配置失败", logger.Err(err))
 		}
 	}
 	s.netUndos = nil
+	s.Logger.Info("网络配置清理完成")
 }
 
 func (s *Session) logSessionStats(interval time.Duration) {
@@ -481,6 +509,313 @@ func (s *Session) setupDataPlane() error {
 	return nil
 }
 
+// setupXFRMDataPlane 配置 XFRM 模式的数据平面
+// 创建 XFRM Interface、安装 SA 和 SP，配置 ESP-in-UDP 封装
+func (s *Session) setupXFRMDataPlane() error {
+	s.Logger.Info("设置 XFRMI 数据平面")
+
+	xfrmMgr := driver.NewXFRMManager()
+	s.xfrmMgr = xfrmMgr
+
+	// 1. 在 socket 上设置 UDP_ENCAP_ESPINUDP
+	if sm, ok := s.socket.(*ipsec.SocketManager); ok {
+		if err := sm.SetUDPEncap(); err != nil {
+			return fmt.Errorf("设置 UDP_ENCAP 失败: %v", err)
+		}
+	}
+
+	// 2. 获取网络参数
+	var localIP, remoteIP net.IP
+	var localPort, remotePort int
+	if sm, ok := s.socket.(*ipsec.SocketManager); ok {
+		localIP = sm.LocalIP()
+		remoteIP = sm.RemoteIP()
+		localPort = int(sm.LocalPort())
+		remotePort = sm.RemotePort()
+
+		// 如果绑定的是 0.0.0.0，需要探测实际出口 IP 用于 SA Src
+		if localIP.IsUnspecified() {
+			s.Logger.Info("LocalIP 未指定 (0.0.0.0)，尝试探测实际出口 IP", logger.String("remote", s.cfg.EpDGAddr))
+			// 使用 UDP 探测路由出口 IP
+			addr := net.JoinHostPort(s.cfg.EpDGAddr, fmt.Sprintf("%d", remotePort))
+			conn, err := net.Dial("udp", addr)
+			if err == nil {
+				localIP = conn.LocalAddr().(*net.UDPAddr).IP
+				conn.Close()
+				s.Logger.Info("探测到实际出口 IP", logger.String("ip", localIP.String()))
+			} else {
+				s.Logger.Warn("探测实际出口 IP 失败，将使用 0.0.0.0 (可能导致 XFRM 封装失败)", logger.Err(err))
+			}
+		}
+	} else {
+		return errors.New("XFRMI 模式需要 SocketManager")
+	}
+
+	// 3. 创建 XFRM 接口
+	xfrmIfName := s.cfg.XFRMIfName
+	if xfrmIfName == "" {
+		xfrmIfName = "ipsec0"
+	}
+	xfrmIfID := s.cfg.XFRMIfID
+	// Linux 内核要求 xfrm if_id > 0，使用出站 SPI 作为默认值（保证非零且唯一）
+	if xfrmIfID == 0 {
+		xfrmIfID = s.ChildSAOut.SPI
+		if xfrmIfID == 0 {
+			xfrmIfID = 42 // 最终兜底
+		}
+	}
+
+	// [前置清理] 参考 strongswan 的策略跟踪表机制，清理可能残留的旧 SA/SP
+	// 防止上一次连接的状态污染导致 file exists 或策略不匹配
+	s.Logger.Info("前置清理：Flush 旧 XFRM State 和 Policy")
+	xfrmMgr.FlushAll()
+
+	// 查找 Underlying Interface (物理接口)
+	// XFRMI 接口最好绑定到底层物理接口，以便内核正确关联流量，避免 TX Error
+	var underlyingIdx int
+	if localIP != nil {
+		if ifaces, err := net.Interfaces(); err == nil {
+			for _, iface := range ifaces {
+				if addrs, err := iface.Addrs(); err == nil {
+					for _, addr := range addrs {
+						// addr is *net.IPNet
+						if ipnet, ok := addr.(*net.IPNet); ok {
+							if ipnet.IP.Equal(localIP) {
+								underlyingIdx = iface.Index
+								s.Logger.Info("绑定底层物理接口", logger.String("iface", iface.Name), logger.Int("idx", iface.Index))
+								break
+							}
+						}
+					}
+				}
+				if underlyingIdx > 0 {
+					break
+				}
+			}
+		}
+	}
+
+	// [Fix Zombie Interfaces] 强制清理同名接口，防止残留导致的状态错乱
+	_ = xfrmMgr.DelXFRMInterface(xfrmIfName)
+
+	if err := xfrmMgr.AddXFRMInterface(xfrmIfName, xfrmIfID, underlyingIdx); err != nil {
+		return fmt.Errorf("创建 XFRM 接口失败: %v", err)
+	}
+	s.netUndos = append(s.netUndos, func() error {
+		return xfrmMgr.DelXFRMInterface(xfrmIfName)
+	})
+
+	// 4. 构建 SA 配置参数
+	// 确保 Socket 启用 UDP 封装 (XFRM 需要)
+	if sm, ok := s.socket.(*ipsec.SocketManager); ok {
+		if err := sm.SetUDPEncap(); err != nil {
+			s.Logger.Warn("设置 Socket UDP Encap 失败", logger.Err(err))
+		}
+	}
+
+	isAEAD := driver.IsAEADAlgorithm(s.childEncrID)
+
+	// 出站 SA (本端 → ePDG)
+	outSACfg := driver.XFRMSAConfig{
+		Src:          localIP,
+		Dst:          remoteIP,
+		SPI:          s.ChildSAOut.SPI,
+		Proto:        netlink.XFRM_PROTO_ESP,
+		Mode:         netlink.XFRM_MODE_TUNNEL,
+		IsAEAD:       isAEAD,
+		EncapType:    netlink.XFRM_ENCAP_ESPINUDP,
+		EncapSrcPort: localPort,
+		EncapDstPort: remotePort,
+		Ifid:         int(xfrmIfID),
+	}
+
+	// 入站 SA (ePDG → 本端)
+	inSACfg := driver.XFRMSAConfig{
+		Src:          remoteIP,
+		Dst:          localIP,
+		SPI:          s.ChildSAIn.SPI,
+		Proto:        netlink.XFRM_PROTO_ESP,
+		Mode:         netlink.XFRM_MODE_TUNNEL,
+		IsAEAD:       isAEAD,
+		EncapType:    netlink.XFRM_ENCAP_ESPINUDP,
+		EncapSrcPort: remotePort,
+		EncapDstPort: localPort,
+		Ifid:         int(xfrmIfID),
+	}
+
+	// 配置算法参数
+	if isAEAD {
+		aeadInfo, err := driver.IKEv2AlgToXFRMAead(s.childEncrID, s.childEncrKeyLenBits)
+		if err != nil {
+			return fmt.Errorf("映射 AEAD 算法失败: %v", err)
+		}
+		outSACfg.AeadAlgoName = aeadInfo.Name
+		outSACfg.AeadKey = s.ChildSAOut.EncryptionKey // 包含 encKey + salt
+		outSACfg.AeadICVLen = aeadInfo.ICVBits
+
+		inSACfg.AeadAlgoName = aeadInfo.Name
+		inSACfg.AeadKey = s.ChildSAIn.EncryptionKey
+		inSACfg.AeadICVLen = aeadInfo.ICVBits
+	} else {
+		cryptInfo, err := driver.IKEv2AlgToXFRMCrypt(s.childEncrID, s.childEncrKeyLenBits)
+		if err != nil {
+			return fmt.Errorf("映射加密算法失败: %v", err)
+		}
+		authInfo, err := driver.IKEv2AlgToXFRMAuth(s.childIntegID)
+		if err != nil {
+			return fmt.Errorf("映射完整性算法失败: %v", err)
+		}
+		outSACfg.CryptAlgoName = cryptInfo.Name
+		outSACfg.CryptKey = s.ChildSAOut.EncryptionKey
+		outSACfg.AuthAlgoName = authInfo.Name
+		outSACfg.AuthKey = s.ChildSAOut.IntegrityKey
+		outSACfg.AuthTruncLen = authInfo.TruncateBits
+
+		inSACfg.CryptAlgoName = cryptInfo.Name
+		inSACfg.CryptKey = s.ChildSAIn.EncryptionKey
+		inSACfg.AuthAlgoName = authInfo.Name
+		inSACfg.AuthKey = s.ChildSAIn.IntegrityKey
+		inSACfg.AuthTruncLen = authInfo.TruncateBits
+	}
+
+	// 5. 安装 SA
+	if err := xfrmMgr.AddSA(outSACfg); err != nil {
+		return err
+	}
+	s.netUndos = append(s.netUndos, func() error {
+		return xfrmMgr.DelSA(outSACfg.SPI, outSACfg.Src, outSACfg.Dst, outSACfg.Proto)
+	})
+
+	if err := xfrmMgr.AddSA(inSACfg); err != nil {
+		return err
+	}
+	s.netUndos = append(s.netUndos, func() error {
+		return xfrmMgr.DelSA(inSACfg.SPI, inSACfg.Src, inSACfg.Dst, inSACfg.Proto)
+	})
+
+	s.Logger.Info("XFRM SA 已安装",
+		logger.Uint32("outSPI", outSACfg.SPI),
+		logger.Uint32("inSPI", inSACfg.SPI),
+		logger.String("local", localIP.String()),
+		logger.String("remote", remoteIP.String()),
+	)
+
+	// 6. 安装 SP (出站和入站)
+	allIPv4 := &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}
+	allIPv6 := &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)}
+
+	// 出站 SP (IPv4)
+	outSP4 := driver.XFRMSPConfig{
+		Src:       allIPv4,
+		Dst:       allIPv4,
+		Dir:       netlink.XFRM_DIR_OUT,
+		TmplSrc:   localIP,
+		TmplDst:   remoteIP,
+		TmplProto: netlink.XFRM_PROTO_ESP,
+		TmplMode:  netlink.XFRM_MODE_TUNNEL,
+		TmplSPI:   int(outSACfg.SPI), // 显式绑定 SPI
+		Ifid:      int(xfrmIfID),
+	}
+	if err := xfrmMgr.AddSP(outSP4); err != nil {
+		return err
+	}
+	s.netUndos = append(s.netUndos, func() error { return xfrmMgr.DelSP(outSP4) })
+
+	// 入站 SP (IPv4)
+	inSP4 := driver.XFRMSPConfig{
+		Src:       allIPv4,
+		Dst:       allIPv4,
+		Dir:       netlink.XFRM_DIR_IN,
+		TmplSrc:   remoteIP,
+		TmplDst:   localIP,
+		TmplProto: netlink.XFRM_PROTO_ESP,
+		TmplMode:  netlink.XFRM_MODE_TUNNEL,
+		TmplSPI:   int(inSACfg.SPI), // 显式验证 SPI
+		Ifid:      int(xfrmIfID),
+	}
+	if err := xfrmMgr.AddSP(inSP4); err != nil {
+		return err
+	}
+	s.netUndos = append(s.netUndos, func() error { return xfrmMgr.DelSP(inSP4) })
+
+	// 转发 SP (IPv4)
+	fwdSP4 := driver.XFRMSPConfig{
+		Src:       allIPv4,
+		Dst:       allIPv4,
+		Dir:       netlink.XFRM_DIR_FWD,
+		TmplSrc:   remoteIP,
+		TmplDst:   localIP,
+		TmplProto: netlink.XFRM_PROTO_ESP,
+		TmplMode:  netlink.XFRM_MODE_TUNNEL,
+		Ifid:      int(xfrmIfID),
+	}
+	if err := xfrmMgr.AddSP(fwdSP4); err != nil {
+		s.Logger.Warn("添加 FWD SP 失败 (非致命)", logger.Err(err))
+	} else {
+		s.netUndos = append(s.netUndos, func() error { return xfrmMgr.DelSP(fwdSP4) })
+	}
+
+	// IPv6 SP (强制安装，覆盖所有 IPv6 流量，即使没有 CP 配置也要允许链路本地流量)
+	outSP6 := driver.XFRMSPConfig{
+		Src: allIPv6, Dst: allIPv6, Dir: netlink.XFRM_DIR_OUT,
+		TmplSrc: localIP, TmplDst: remoteIP,
+		TmplProto: netlink.XFRM_PROTO_ESP, TmplMode: netlink.XFRM_MODE_TUNNEL,
+		TmplSPI: int(outSACfg.SPI), // 显式绑定 SPI
+		Ifid:    int(xfrmIfID),
+	}
+	// Panic removed
+	if err := xfrmMgr.AddSP(outSP6); err != nil {
+		s.Logger.Warn("添加 IPv6 出站 SP 失败 (非致命)", logger.Err(err))
+	} else {
+		s.netUndos = append(s.netUndos, func() error { return xfrmMgr.DelSP(outSP6) })
+	}
+
+	inSP6 := driver.XFRMSPConfig{
+		Src: allIPv6, Dst: allIPv6, Dir: netlink.XFRM_DIR_IN,
+		TmplSrc: remoteIP, TmplDst: localIP,
+		TmplProto: netlink.XFRM_PROTO_ESP, TmplMode: netlink.XFRM_MODE_TUNNEL,
+		TmplSPI: int(inSACfg.SPI), // 显式验证 SPI
+		Ifid:    int(xfrmIfID),
+	}
+	if err := xfrmMgr.AddSP(inSP6); err != nil {
+		s.Logger.Warn("添加 IPv6 入站 SP 失败 (非致命)", logger.Err(err))
+	} else {
+		s.netUndos = append(s.netUndos, func() error { return xfrmMgr.DelSP(inSP6) })
+	}
+
+	s.Logger.Info("XFRM SP 已安装")
+
+	// 7. 在 XFRM 接口上配置 IP 地址和路由
+	// 复用 applyNetworkConfigOnTUN (它只依赖接口名)
+	if err := s.net.SetLinkUp(xfrmIfName); err != nil {
+		return fmt.Errorf("启动 XFRM 接口失败: %v", err)
+	}
+	mtu := s.cfg.TUNMTU
+	if mtu == 0 {
+		mtu = 1280 // XFRMI 可以用更大的 MTU (内核处理开销更小)
+	}
+	if mtu > 0 && s.cpConfig != nil && len(s.cpConfig.IPv6Addresses) > 0 && mtu < 1280 {
+		mtu = 1280
+	}
+	if mtu > 0 {
+		if err := s.net.SetMTU(xfrmIfName, mtu); err != nil {
+			s.Logger.Warn("设置 XFRM 接口 MTU 失败", logger.Err(err))
+		}
+	}
+
+	if err := s.applyNetworkConfigOnTUN(xfrmIfName); err != nil {
+		s.cleanupNetworkConfig()
+		return fmt.Errorf("在 XFRM 接口上配置网络失败: %v", err)
+	}
+
+	s.Logger.Info("XFRMI 数据平面已就绪",
+		logger.String("iface", xfrmIfName),
+		logger.Uint32("ifID", xfrmIfID),
+		logger.Int("mtu", mtu))
+
+	return nil
+}
+
 type netToolsDeleter interface {
 	DelAddress(iface string, cidr string) error
 	DelRoute(cidr string, gw string, iface string) error
@@ -548,6 +883,8 @@ func (s *Session) applyNetworkConfigOnTUN(iface string) error {
 		DelRule(srcCIDR string, table int) error
 		AddInputRule(iface string, table int) error
 		DelInputRule(iface string, table int) error
+		CleanConflictRoutes(cidrs []string, keepIface string, family int)
+		SetSysctl(key, value string) error
 	}
 	_, enablePolicyRouting := s.net.(policyRouter)
 
@@ -662,6 +999,7 @@ func (s *Session) applyNetworkConfigOnTUN(iface string) error {
 				s.netUndos = append(s.netUndos, func() error { return pr.DelRouteTable(c, iface, tbl) })
 			}
 			for _, cidr := range routes6 {
+				// Revert: StrongSwan uses direct routes. Let's try direct routes again with ARP enabled.
 				if err := pr.AddRouteTable(cidr, iface, tableID); err != nil {
 					return err
 				}
@@ -670,16 +1008,25 @@ func (s *Session) applyNetworkConfigOnTUN(iface string) error {
 				s.netUndos = append(s.netUndos, func() error { return pr.DelRouteTable(c, iface, tbl) })
 			}
 
-			// [自检] 打印路由规则以诊断残留问题
-			go func(tid int) {
-				time.Sleep(1 * time.Second) // 稍等规则生效
-				if out, err := exec.Command("ip", "rule", "show").CombinedOutput(); err == nil {
-					s.Logger.Info("策略路由规则快照", logger.String("rules", string(out)))
+			// [清理 main 表冲突路由]
+			// 其他设备或旧 session 可能在 main 表中留下到 P-CSCF 的路由 (dev ens2)，
+			// 这些路由会抢占策略路由，导致 Go dial tcp 走物理接口而非 XFRM 隧道
+			pr.CleanConflictRoutes(routes6, iface, netlink.FAMILY_V6)
+			pr.CleanConflictRoutes(routes, iface, netlink.FAMILY_V4)
+
+			// XFRM 接口初始化：确保 IPv6 可用
+			go func() {
+				time.Sleep(500 * time.Millisecond)
+				// 确保接口 UP
+				if nt, ok := s.net.(*driver.NetTools); ok {
+					_ = nt.SetLinkUp(iface)
+					// 添加 Link-Local 地址（XFRM 接口无 ARP 可能不会自动生成）
+					_ = nt.AddAddress6(iface, "fe80::1/64")
 				}
-				if out, err := exec.Command("ip", "route", "show", "table", fmt.Sprintf("%d", tid)).CombinedOutput(); err == nil {
-					s.Logger.Info("路由表快照", logger.Int("table", tid), logger.String("routes", string(out)))
-				}
-			}(tableID)
+				// 确保 IPv6 启用且禁用 DAD（XFRM 接口无需邻居发现）
+				_ = pr.SetSysctl(fmt.Sprintf("net.ipv6.conf.%s.disable_ipv6", iface), "0")
+				_ = pr.SetSysctl(fmt.Sprintf("net.ipv6.conf.%s.accept_dad", iface), "0")
+			}()
 
 			return nil
 		}

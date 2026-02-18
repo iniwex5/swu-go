@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/iniwex5/swu-go/pkg/ikev2"
@@ -386,4 +387,54 @@ func (s *SocketManager) Stats() SocketStats {
 		DroppedIKE:  atomic.LoadUint64(&s.droppedIKE),
 		DroppedESP:  atomic.LoadUint64(&s.droppedESP),
 	}
+}
+
+// RawFD 返回底层 UDP socket 的文件描述符
+// 用于 XFRM SA 的 ESP-in-UDP encap 配置
+func (s *SocketManager) RawFD() (int, error) {
+	rawConn, err := s.Conn.SyscallConn()
+	if err != nil {
+		return -1, fmt.Errorf("获取 SyscallConn 失败: %v", err)
+	}
+
+	var fd int
+	var fdErr error
+	err = rawConn.Control(func(f uintptr) {
+		fd = int(f)
+	})
+	if err != nil {
+		return -1, fmt.Errorf("获取 FD 失败: %v", err)
+	}
+	return fd, fdErr
+}
+
+// SetUDPEncap 在 socket 上设置 UDP_ENCAP_ESPINUDP
+// 使内核 XFRM 通过此 socket 收发 ESP-in-UDP 包
+// 设置后，内核会自动处理 ESP 包的 UDP 封装/解封装
+func (s *SocketManager) SetUDPEncap() error {
+	rawConn, err := s.Conn.SyscallConn()
+	if err != nil {
+		return fmt.Errorf("获取 SyscallConn 失败: %v", err)
+	}
+
+	var setErr error
+	err = rawConn.Control(func(fd uintptr) {
+		// UDP_ENCAP = 100, UDP_ENCAP_ESPINUDP = 2
+		const (
+			solUDP           = 17 // SOL_UDP
+			udpEncap         = 100
+			udpEncapESPInUDP = 2
+		)
+		setErr = syscall.SetsockoptInt(int(fd), solUDP, udpEncap, udpEncapESPInUDP)
+	})
+	if err != nil {
+		return fmt.Errorf("Control 调用失败: %v", err)
+	}
+	if setErr != nil {
+		return fmt.Errorf("设置 UDP_ENCAP_ESPINUDP 失败: %v", setErr)
+	}
+
+	logger.Info("已在 socket 上设置 UDP_ENCAP_ESPINUDP",
+		logger.String("local", s.LocalAddr.String()))
+	return nil
 }

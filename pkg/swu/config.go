@@ -14,6 +14,12 @@ type Config struct {
 	SIM          sim.SIMProvider
 	EnableDriver bool // 是否创建 TUN 和路由 (需要 root)
 
+	// 数据平面模式: "tun" (默认，用户空间 ESP) 或 "xfrmi" (内核 XFRM offload)
+	DataplaneMode string
+	// XFRMI 模式专用配置
+	XFRMIfName string // XFRM 接口名 (默认 "ipsec0")
+	XFRMIfID   uint32 // XFRM interface ID (默认自动分配)
+
 	// 可选的特定配置
 	MCC       string
 	MNC       string

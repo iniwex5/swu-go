@@ -4,14 +4,16 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"strings"
 	"syscall"
 	"time"
 
-	"github.com/vishvananda/netlink"
+	"github.com/iniwex5/netlink"
 	"golang.org/x/sys/unix"
 )
 
-// NetTools 封装网络配置操作（使用 vishvananda/netlink）
+// NetTools 封装网络配置操作
 type NetTools struct{}
 
 // NewNetTools 创建 NetTools 实例
@@ -323,6 +325,11 @@ func (n *NetTools) AddRule(srcCIDR string, table int) error {
 	rule := netlink.NewRule()
 	rule.Src = src
 	rule.Table = table
+	if src.IP.To4() == nil {
+		rule.Family = netlink.FAMILY_V6
+	} else {
+		rule.Family = netlink.FAMILY_V4
+	}
 
 	// 清理旧规则 (防止 Table ID 变更导致残留规则指向无效表)
 	// 查找所有源地址匹配的规则并删除
@@ -367,27 +374,45 @@ func (n *NetTools) DelRule(srcCIDR string, table int) error {
 
 // AddInputRule 添加基于入站接口的策略路由规则：iif <iface> lookup <table>
 func (n *NetTools) AddInputRule(iface string, table int) error {
-	rule := netlink.NewRule()
-	rule.IifName = iface
-	rule.Table = table
+	// 添加 IPv4 规则
+	rule4 := netlink.NewRule()
+	rule4.IifName = iface
+	rule4.Table = table
+	rule4.Family = netlink.FAMILY_V4
 
-	// 清理旧规则 (防止 Table ID 变更)
-	// 查找所有入站接口匹配的规则并删除 (IPv4/IPv6 都查)
-	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
-		if rules, err := netlink.RuleList(family); err == nil {
-			for _, r := range rules {
-				if r.IifName == iface {
-					_ = netlink.RuleDel(&r)
-				}
+	// 清理旧规则 (IPv4)
+	if rules, err := netlink.RuleList(netlink.FAMILY_V4); err == nil {
+		for _, r := range rules {
+			if r.IifName == iface {
+				_ = netlink.RuleDel(&r)
 			}
 		}
 	}
 
-	err := netlink.RuleAdd(rule)
-	if err != nil && isRuleExists(err) {
-		return nil
+	if err := netlink.RuleAdd(rule4); err != nil && !isRuleExists(err) {
+		return wrapErr("rule add v4", fmt.Sprintf("iif %s lookup %d", iface, table), err)
 	}
-	return wrapErr("rule add", fmt.Sprintf("iif %s lookup %d", iface, table), err)
+
+	// 添加 IPv6 规则
+	rule6 := netlink.NewRule()
+	rule6.IifName = iface
+	rule6.Table = table
+	rule6.Family = netlink.FAMILY_V6
+
+	// 清理旧规则 (IPv6)
+	if rules, err := netlink.RuleList(netlink.FAMILY_V6); err == nil {
+		for _, r := range rules {
+			if r.IifName == iface {
+				_ = netlink.RuleDel(&r)
+			}
+		}
+	}
+
+	if err := netlink.RuleAdd(rule6); err != nil && !isRuleExists(err) {
+		return wrapErr("rule add v6", fmt.Sprintf("iif %s lookup %d", iface, table), err)
+	}
+
+	return nil
 }
 
 // DelInputRule 删除基于入站接口的策略路由规则
@@ -402,4 +427,66 @@ func (n *NetTools) DelInputRule(iface string, table int) error {
 		return nil
 	}
 	return wrapErr("rule del", fmt.Sprintf("iif %s lookup %d", iface, table), err)
+}
+
+// CleanConflictRoutes 删除 main 表中指向非指定接口的冲突路由
+// 用于清理其他设备或旧 session 残留的 P-CSCF 路由（如 dev ens2），
+// 避免这些路由抢占策略路由导致流量走物理接口而非 XFRM 隧道。
+// family: netlink.FAMILY_V4 或 netlink.FAMILY_V6
+func (n *NetTools) CleanConflictRoutes(cidrs []string, keepIface string, family int) {
+	kLink, _ := getLink(keepIface)
+	var keepIdx int
+	if kLink != nil {
+		keepIdx = kLink.Attrs().Index
+	}
+
+	for _, cidr := range cidrs {
+		// 跳过默认路由
+		if cidr == "::/0" || cidr == "0.0.0.0/0" {
+			continue
+		}
+		// 去掉 /128 或 /32 后缀以获取纯 IP，然后构造精确匹配的 CIDR
+		target := strings.TrimSuffix(strings.TrimSuffix(cidr, "/128"), "/32")
+		_, dst, err := net.ParseCIDR(cidr)
+		if err != nil {
+			// 尝试将纯 IP 转为 CIDR
+			ip := net.ParseIP(target)
+			if ip == nil {
+				continue
+			}
+			if ip.To4() != nil {
+				dst = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
+			} else {
+				dst = &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
+			}
+		}
+
+		// 查询 main 表中到该目的地的路由
+		filter := &netlink.Route{
+			Dst:   dst,
+			Table: unix.RT_TABLE_MAIN,
+		}
+		routes, err := netlink.RouteListFiltered(family, filter, netlink.RT_FILTER_DST|netlink.RT_FILTER_TABLE)
+		if err != nil || len(routes) == 0 {
+			continue
+		}
+
+		// 删除不指向 keepIface 的路由
+		for _, r := range routes {
+			if r.LinkIndex != keepIdx {
+				_ = netlink.RouteDel(&r)
+			}
+		}
+	}
+}
+
+// SetSysctl 设置内核参数（替代 exec.Command("sysctl", "-w", ...)）
+// key 格式如 "net.ipv6.conf.ims-ec20_1.disable_ipv6"
+func (n *NetTools) SetSysctl(key, value string) error {
+	// 将 dot 分隔的 key 转为 /proc/sys/ 路径
+	path := "/proc/sys/" + strings.ReplaceAll(key, ".", "/")
+	if err := os.WriteFile(path, []byte(value), 0644); err != nil {
+		return fmt.Errorf("设置 sysctl %s=%s 失败: %v", key, value, err)
+	}
+	return nil
 }

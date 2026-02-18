@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"runtime"
 
-	"github.com/vishvananda/netlink"
+	"github.com/iniwex5/netlink"
 	"github.com/vishvananda/netns"
 )
 

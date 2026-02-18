@@ -3,7 +3,7 @@ module github.com/iniwex5/swu-go
 go 1.24.0
 
 require (
-	github.com/vishvananda/netlink v1.3.1
+	github.com/iniwex5/netlink v1.3.3
 	github.com/vishvananda/netns v0.0.5
 	go.uber.org/multierr v1.10.0
 	go.uber.org/zap v1.27.1
