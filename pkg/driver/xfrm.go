@@ -1,8 +1,10 @@
 package driver
 
 import (
+	"errors"
 	"fmt"
 	"net"
+	"syscall"
 
 	"github.com/iniwex5/netlink"
 )
@@ -223,7 +225,7 @@ func (x *XFRMManager) DelSA(spi uint32, src, dst net.IP, proto netlink.Proto) er
 	}
 	if err := netlink.XfrmStateDel(state); err != nil {
 		// SA 不存在（Rekey 后旧 SA 已被替换删除）视为正常
-		if err.Error() == "no such process" {
+		if errors.Is(err, syscall.ESRCH) {
 			return nil
 		}
 		return fmt.Errorf("删除 XFRM SA (spi=0x%x) 失败: %v", spi, err)
@@ -282,7 +284,7 @@ func (x *XFRMManager) DelSP(cfg XFRMSPConfig) error {
 		Ifid: cfg.Ifid,
 	}
 	if err := netlink.XfrmPolicyDel(policy); err != nil {
-		if err.Error() == "no such process" {
+		if errors.Is(err, syscall.ESRCH) {
 			return nil
 		}
 		return fmt.Errorf("删除 XFRM SP (dir=%s) 失败: %v", cfg.Dir, err)
