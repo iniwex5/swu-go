@@ -3,6 +3,7 @@ package swu
 import (
 	"encoding/binary"
 	"fmt"
+	"time"
 
 	"github.com/iniwex5/swu-go/pkg/crypto"
 	"github.com/iniwex5/swu-go/pkg/ikev2"
@@ -68,17 +69,41 @@ func (s *Session) ikeDispatchLoop() {
 				continue
 			}
 
+			s.Logger.Debug("收到 ePDG 发起的请求",
+				logger.Int("exchangeType", int(hdr.ExchangeType)),
+				logger.Uint32("msgID", hdr.MessageID))
+
 			switch hdr.ExchangeType {
 			case ikev2.INFORMATIONAL:
 				if err := s.handleIncomingInformational(data); err != nil {
 					s.Logger.Warn("处理 INFORMATIONAL 失败", logger.Err(err))
 				}
 			case ikev2.CREATE_CHILD_SA:
-				if err := s.handleIncomingCreateChildSA(data); err != nil {
-					s.Logger.Warn("处理 CREATE_CHILD_SA 失败", logger.Err(err))
-				}
+				s.dispatchCreateChildSA(data)
+			default:
+				s.Logger.Warn("收到未知 Exchange Type",
+					logger.Int("type", int(hdr.ExchangeType)))
 			}
 		}
+	}
+}
+
+// dispatchCreateChildSA 解密 CREATE_CHILD_SA 并分发到 Child SA Rekey 或 IKE SA Rekey
+func (s *Session) dispatchCreateChildSA(data []byte) {
+	msgID, payloads, err := s.decryptAndParse(data)
+	if err != nil {
+		s.Logger.Warn("解密 CREATE_CHILD_SA 失败", logger.Err(err))
+		return
+	}
+
+	// 统一交给 handleIncomingCreateChildSAParsed 分发处理
+	// 该函数会根据 ProtocolID 区分 Child SA Rekey 和 IKE SA Rekey
+	s.Logger.Info("收到 CREATE_CHILD_SA 请求，开始处理",
+		logger.Uint32("msgID", msgID))
+	if err := s.handleIncomingCreateChildSAParsed(msgID, payloads); err != nil {
+		s.Logger.Warn("处理 CREATE_CHILD_SA 失败", logger.Err(err))
+	} else {
+		s.Logger.Info("Child SA Rekey 处理完成")
 	}
 }
 
@@ -96,14 +121,112 @@ func (s *Session) handleIncomingInformational(data []byte) error {
 		return err
 	}
 
+	// 没有载荷 = DPD 请求，直接回复空 INFORMATIONAL
+	if len(payloads) == 0 {
+		s.Logger.Debug("收到对端 DPD 请求，回复空 INFORMATIONAL")
+		return s.sendEncryptedResponseWithMsgID(nil, ikev2.INFORMATIONAL, msgID)
+	}
+
 	for _, pl := range payloads {
+		if notify, ok := pl.(*ikev2.EncryptedPayloadNotify); ok {
+			// RFC 6311: IKEV2_MESSAGE_ID_SYNC
+			if notify.NotifyType == ikev2.IKEV2_MESSAGE_ID_SYNC {
+				if len(notify.NotifyData) < 12 {
+					s.Logger.Warn("IKEV2_MESSAGE_ID_SYNC 数据不足 12 字节",
+						logger.Int("len", len(notify.NotifyData)))
+					continue
+				}
+				// RFC 6311 §5.1: Notify Data = PENDING_NUM(4) + EXPECTED_SEND(4) + EXPECTED_RECV(4)
+				// PENDING_NUM: 对端未响应的请求数量
+				// EXPECTED_SEND: 对端下一个要发送的 Message ID
+				// EXPECTED_RECV: 对端期望从我们收到的下一个 Message ID
+				pendingNum := binary.BigEndian.Uint32(notify.NotifyData[0:4])
+				expectedSend := binary.BigEndian.Uint32(notify.NotifyData[4:8])
+				expectedRecv := binary.BigEndian.Uint32(notify.NotifyData[8:12])
+
+				s.Logger.Info("收到 IKEV2_MESSAGE_ID_SYNC (RFC 6311)",
+					logger.Uint32("pendingNum", pendingNum),
+					logger.Uint32("expectedSend", expectedSend),
+					logger.Uint32("expectedRecv", expectedRecv),
+					logger.Uint32("currentSeqNum", s.SequenceNumber))
+
+				// 更新本端 SequenceNumber：对端期望从我们收到的下一个 ID
+				// 只允许向前调整（防止回退攻击）
+				if expectedRecv > s.SequenceNumber {
+					s.Logger.Info("MID Sync: 更新 SequenceNumber",
+						logger.Uint32("old", s.SequenceNumber),
+						logger.Uint32("new", expectedRecv))
+					s.SequenceNumber = expectedRecv
+				}
+
+				// 回复 MID Sync 响应（RFC 6311 §5.2）
+				// 响应中 Notify Data = EXPECTED_SEND(4) + EXPECTED_RECV(4)
+				// 其中 EXPECTED_SEND = 我们下一个要发送的 MsgID (SequenceNumber)
+				// EXPECTED_RECV = msgID + 1 (我们期望对端的下一个请求 ID)
+				respData := make([]byte, 8)
+				binary.BigEndian.PutUint32(respData[0:4], s.SequenceNumber)
+				binary.BigEndian.PutUint32(respData[4:8], msgID+1)
+				syncResp := &ikev2.EncryptedPayloadNotify{
+					ProtocolID: 0,
+					NotifyType: ikev2.IKEV2_MESSAGE_ID_SYNC,
+					NotifyData: respData,
+				}
+				return s.sendEncryptedResponseWithMsgID(
+					[]ikev2.Payload{syncResp}, ikev2.INFORMATIONAL, msgID)
+			}
+			// RFC 4555: UPDATE_SA_ADDRESSES — ePDG 地址变更
+			if notify.NotifyType == ikev2.UPDATE_SA_ADDRESSES {
+				s.Logger.Info("收到 ePDG 发起的 UPDATE_SA_ADDRESSES (RFC 4555)")
+				if s.mobikeSupported {
+					// 用报文实际来源更新内核 SA/SP (参考 strongSwan ike_mobike.c:445-468)
+					if s.xfrmMgr != nil {
+						if sm, ok := s.socket.(*ipsec.SocketManager); ok {
+							newRemoteIP := sm.RemoteIP()
+							newLocalIP := sm.LocalIP()
+							if newRemoteIP != nil && newLocalIP != nil {
+								if err := s.updateXFRMState(newLocalIP.String(), newRemoteIP.String()); err != nil {
+									s.Logger.Warn("UPDATE_SA_ADDRESSES: 更新 XFRM 失败", logger.Err(err))
+								} else {
+									s.Logger.Info("UPDATE_SA_ADDRESSES: XFRM 已更新",
+										logger.String("localIP", newLocalIP.String()),
+										logger.String("remoteIP", newRemoteIP.String()))
+								}
+							}
+						}
+					}
+					// 提取请求中的 COOKIE2，并在响应中原样回传 (RFC 4555 §3.5)
+					var respPayloads []ikev2.Payload
+					for _, pl2 := range payloads {
+						if n2, ok2 := pl2.(*ikev2.EncryptedPayloadNotify); ok2 {
+							if n2.NotifyType == ikev2.COOKIE2 && len(n2.NotifyData) > 0 {
+								respPayloads = append(respPayloads, &ikev2.EncryptedPayloadNotify{
+									ProtocolID: 0,
+									NotifyType: ikev2.COOKIE2,
+									NotifyData: n2.NotifyData,
+								})
+								s.Logger.Debug("UPDATE_SA_ADDRESSES: 回传 COOKIE2")
+							}
+						}
+					}
+					return s.sendEncryptedResponseWithMsgID(respPayloads, ikev2.INFORMATIONAL, msgID)
+				} else {
+					s.Logger.Warn("收到 UPDATE_SA_ADDRESSES 但 MOBIKE 未协商")
+				}
+				continue
+			}
+			continue // 其他未知 Notify 跳过
+		}
+
 		del, ok := pl.(*ikev2.EncryptedPayloadDelete)
 		if !ok {
 			continue
 		}
 
 		if del.ProtocolID == ikev2.ProtoIKE {
-			if s.cancel != nil {
+			s.Logger.Warn("收到 ePDG 发起的 IKE SA Delete，会话即将关闭")
+			if s.OnSessionDown != nil {
+				go s.OnSessionDown()
+			} else if s.cancel != nil {
 				s.cancel()
 			}
 			continue
@@ -115,6 +238,8 @@ func (s *Session) handleIncomingInformational(data []byte) error {
 
 		for i := 0; i+4 <= len(del.SPIs); i += 4 {
 			spi := binary.BigEndian.Uint32(del.SPIs[i : i+4])
+			s.Logger.Warn("收到 ePDG 发起的 Child SA Delete",
+				logger.Uint32("spi", spi))
 			if s.ChildSAsIn != nil {
 				delete(s.ChildSAsIn, spi)
 			}
@@ -130,16 +255,26 @@ func (s *Session) handleIncomingInformational(data []byte) error {
 	return s.sendEncryptedResponseWithMsgID(nil, ikev2.INFORMATIONAL, msgID)
 }
 
-func (s *Session) handleIncomingCreateChildSA(data []byte) error {
-	msgID, payloads, err := s.decryptAndParse(data)
-	if err != nil {
-		return err
+func (s *Session) handleIncomingCreateChildSAParsed(msgID uint32, payloads []ikev2.Payload) error {
+	// Rekey Collision 检测：如果本端正在主动 Rekey（持有 rekeyMu），
+	// 则回复 TEMPORARY_FAILURE 让 ePDG 稍后重试
+	// 参考 strongSwan child_rekey.c 碰撞处理
+	if !s.rekeyMu.TryLock() {
+		s.Logger.Warn("检测到 Rekey 碰撞（本端正在 Rekey），响应 TEMPORARY_FAILURE",
+			logger.Uint32("msgID", msgID))
+		notify := &ikev2.EncryptedPayloadNotify{
+			ProtocolID: 0,
+			NotifyType: ikev2.TEMPORARY_FAILURE,
+		}
+		return s.sendEncryptedResponseWithMsgID([]ikev2.Payload{notify}, ikev2.CREATE_CHILD_SA, msgID)
 	}
+	defer s.rekeyMu.Unlock()
 
 	var reqSA *ikev2.EncryptedPayloadSA
 	var reqNonce []byte
 	var peerSPI uint32
 	var encrID uint16
+	var protoID ikev2.ProtocolID
 	var tsi []*ikev2.TrafficSelector
 	var tsr []*ikev2.TrafficSelector
 
@@ -147,10 +282,11 @@ func (s *Session) handleIncomingCreateChildSA(data []byte) error {
 		switch p := pl.(type) {
 		case *ikev2.EncryptedPayloadSA:
 			reqSA = p
-			if len(p.Proposals) > 0 && len(p.Proposals[0].SPI) >= 4 {
-				peerSPI = binary.BigEndian.Uint32(p.Proposals[0].SPI)
-			}
 			if len(p.Proposals) > 0 {
+				protoID = p.Proposals[0].ProtocolID
+				if len(p.Proposals[0].SPI) >= 4 {
+					peerSPI = binary.BigEndian.Uint32(p.Proposals[0].SPI)
+				}
 				for _, t := range p.Proposals[0].Transforms {
 					if t.Type == ikev2.TransformTypeEncr {
 						encrID = uint16(t.ID)
@@ -170,6 +306,11 @@ func (s *Session) handleIncomingCreateChildSA(data []byte) error {
 				return fmt.Errorf("CREATE_CHILD_SA 错误通知: %d", p.NotifyType)
 			}
 		}
+	}
+
+	// 检查是否为 IKE SA Rekey (Proto = IKE)
+	if protoID == ikev2.ProtoIKE {
+		return s.HandleRekeyIKESARequest(msgID, payloads)
 	}
 
 	if reqSA == nil || len(reqNonce) == 0 || peerSPI == 0 || encrID == 0 {
@@ -222,17 +363,51 @@ func (s *Session) handleIncomingCreateChildSA(data []byte) error {
 	inSA := ipsec.NewSecurityAssociation(peerSPI, childEnc, inKey, nil)
 	inSA.RemoteSPI = ourSPI
 
+	// 保存旧 SPI 用于内核 SA 替换
+	var oldOutSPI, oldInSPI uint32
+	if s.ChildSAOut != nil {
+		oldOutSPI = s.ChildSAOut.SPI
+	}
+	if s.ChildSAIn != nil {
+		oldInSPI = s.ChildSAIn.SPI
+	}
+
+	// 替换主 SA 引用
+	s.ChildSAOut = outSA
+	s.ChildSAIn = inSA
 	if s.ChildSAsIn != nil {
 		s.ChildSAsIn[peerSPI] = inSA
 	}
 
 	if len(tsr) > 0 {
-		pol := childOutPolicy{saOut: outSA, tsr: tsr}
-		s.childOutPolicies = append([]childOutPolicy{pol}, s.childOutPolicies...)
+		if len(s.childOutPolicies) > 0 {
+			s.childOutPolicies[0].saOut = outSA
+		} else {
+			s.childOutPolicies = append(s.childOutPolicies, childOutPolicy{saOut: outSA, tsr: tsr})
+		}
 	}
 
 	if s.ws != nil {
 		s.ws.LogChildSA(ourSPI, peerSPI, s.cfg.LocalAddr, s.cfg.EpDGAddr, inKey, outKey, encrID)
+	}
+
+	// 更新内核 XFRM SA（XFRMI 模式）
+	if s.xfrmMgr != nil && oldOutSPI != 0 {
+		if err := s.rekeyXFRMSA(oldOutSPI, oldInSPI, outSA, inSA, encrID, encrKeyLenBits); err != nil {
+			s.Logger.Warn("对端 Rekey 后更新内核 XFRM SA 失败", logger.Err(err))
+		}
+	}
+
+	s.Logger.Info("对端 CHILD_SA Rekey 成功",
+		logger.Uint32("oldOutSPI", oldOutSPI),
+		logger.Uint32("newOutSPI", ourSPI),
+		logger.Uint32("peerSPI", peerSPI))
+
+	// 被动 Rekey 成功后，重置冷却期和 Child Rekey Timer
+	s.lastRekeyTime = time.Now()
+	select {
+	case s.childRekeyResetCh <- struct{}{}:
+	default:
 	}
 
 	respProp := ikev2.NewProposal(1, ikev2.ProtoESP, spiBytes)

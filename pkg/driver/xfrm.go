@@ -58,6 +58,23 @@ type XFRMSAConfig struct {
 
 	// Tunnel 模式 (VoWiFi 使用 tunnel 模式)
 	Mode netlink.Mode // XFRM_MODE_TUNNEL
+
+	// SA 生命周期（秒），用于触发内核 XFRM_MSG_EXPIRE 事件
+	// Soft: 触发 rekey（默认 3300s = 55分钟）
+	// Hard: 强制删除（默认 3600s = 60分钟）
+	TimeLimitSoft uint64
+	TimeLimitHard uint64
+
+	// 抗重放窗口大小（0 = 使用默认值 32）
+	ReplayWindow int
+
+	// SA 方向标记（Linux 6.x+, XFRMA_SA_DIR）
+	// 0 = 不设置, netlink.XFRM_SA_DIR_IN = 入站, netlink.XFRM_SA_DIR_OUT = 出站
+	SADir netlink.SADir
+
+	// 扩展序列号（ESN, RFC 4303 §2.2.1）
+	// 64 位序列号，防止高速网络下 32 位 SN 溢出
+	ESN bool
 }
 
 // XFRMSPConfig XFRM Security Policy 配置
@@ -129,17 +146,27 @@ func (x *XFRMManager) DelXFRMInterface(name string) error {
 
 // AddSA 添加 XFRM Security Association
 func (x *XFRMManager) AddSA(cfg XFRMSAConfig) error {
+	replayWindow := cfg.ReplayWindow
+	if replayWindow <= 0 {
+		replayWindow = 32
+	}
 	state := &netlink.XfrmState{
 		Src:          cfg.Src,
 		Dst:          cfg.Dst,
 		Proto:        cfg.Proto,
 		Mode:         cfg.Mode,
 		Spi:          int(cfg.SPI),
-		ReplayWindow: 32,
+		ReplayWindow: replayWindow,
 		Ifid:         cfg.Ifid,
 		// 参考 strongswan kernel_netlink_ipsec.c:1857
 		// tunnel mode SA 需要设置 XFRM_STATE_AF_UNSPEC，允许处理任意地址族的流量
 		AFUnspec: cfg.Mode == netlink.XFRM_MODE_TUNNEL,
+		ESN:      cfg.ESN,
+		SADir:    cfg.SADir,
+		Limits: netlink.XfrmStateLimits{
+			TimeSoft: cfg.TimeLimitSoft,
+			TimeHard: cfg.TimeLimitHard,
+		},
 	}
 
 	// 配置算法
@@ -186,7 +213,7 @@ func (x *XFRMManager) AddSA(cfg XFRMSAConfig) error {
 	return nil
 }
 
-// DelSA 删除 XFRM SA
+// DelSA 删除 XFRM SA（幂等：SA 不存在时静默返回 nil）
 func (x *XFRMManager) DelSA(spi uint32, src, dst net.IP, proto netlink.Proto) error {
 	state := &netlink.XfrmState{
 		Src:   src,
@@ -195,6 +222,10 @@ func (x *XFRMManager) DelSA(spi uint32, src, dst net.IP, proto netlink.Proto) er
 		Spi:   int(spi),
 	}
 	if err := netlink.XfrmStateDel(state); err != nil {
+		// SA 不存在（Rekey 后旧 SA 已被替换删除）视为正常
+		if err.Error() == "no such process" {
+			return nil
+		}
 		return fmt.Errorf("删除 XFRM SA (spi=0x%x) 失败: %v", spi, err)
 	}
 	return nil
@@ -242,7 +273,7 @@ func (x *XFRMManager) AddSP(cfg XFRMSPConfig) error {
 	return nil
 }
 
-// DelSP 删除 XFRM Security Policy
+// DelSP 删除 XFRM Security Policy（幂等：不存在时静默返回 nil）
 func (x *XFRMManager) DelSP(cfg XFRMSPConfig) error {
 	policy := &netlink.XfrmPolicy{
 		Src:  cfg.Src,
@@ -251,6 +282,9 @@ func (x *XFRMManager) DelSP(cfg XFRMSPConfig) error {
 		Ifid: cfg.Ifid,
 	}
 	if err := netlink.XfrmPolicyDel(policy); err != nil {
+		if err.Error() == "no such process" {
+			return nil
+		}
 		return fmt.Errorf("删除 XFRM SP (dir=%s) 失败: %v", cfg.Dir, err)
 	}
 	return nil
@@ -267,4 +301,102 @@ func (x *XFRMManager) Cleanup() {
 // UndoFuncs 返回所有回滚函数（供 Session 集成到统一的 cleanup 机制）
 func (x *XFRMManager) UndoFuncs() []func() error {
 	return x.undos
+}
+
+// UpdateSA 更新现有的 XFRM SA (用于 MOBIKE 地址变更)
+func (x *XFRMManager) UpdateSA(cfg XFRMSAConfig) error {
+	state := x.buildXfrmState(cfg)
+	if err := netlink.XfrmStateUpdate(state); err != nil {
+		return fmt.Errorf("更新 XFRM State 失败: %v", err)
+	}
+	return nil
+}
+
+// UpdateSP 更新现有的 XFRM SP
+func (x *XFRMManager) UpdateSP(cfg XFRMSPConfig) error {
+	policy := x.buildXfrmPolicy(cfg)
+	if err := netlink.XfrmPolicyUpdate(policy); err != nil {
+		return fmt.Errorf("更新 XFRM Policy 失败: %v", err)
+	}
+	return nil
+}
+
+// buildXfrmState 根据配置构建 netlink.XfrmState 对象
+func (x *XFRMManager) buildXfrmState(cfg XFRMSAConfig) *netlink.XfrmState {
+	state := &netlink.XfrmState{
+		Src:   cfg.Src,
+		Dst:   cfg.Dst,
+		Proto: cfg.Proto,
+		Mode:  cfg.Mode,
+		Spi:   int(cfg.SPI),
+		Ifid:  cfg.Ifid,
+	}
+
+	// 算法配置
+	if cfg.IsAEAD {
+		state.Aead = &netlink.XfrmStateAlgo{
+			Name:   cfg.AeadAlgoName,
+			Key:    cfg.AeadKey,
+			ICVLen: cfg.AeadICVLen,
+		}
+	} else {
+		state.Auth = &netlink.XfrmStateAlgo{
+			Name: cfg.AuthAlgoName,
+			Key:  cfg.AuthKey,
+		}
+		state.Crypt = &netlink.XfrmStateAlgo{
+			Name: cfg.CryptAlgoName,
+			Key:  cfg.CryptKey,
+		}
+	}
+
+	// 封装配置
+	if cfg.EncapType != 0 {
+		state.Encap = &netlink.XfrmStateEncap{
+			Type:    cfg.EncapType,
+			SrcPort: cfg.EncapSrcPort,
+			DstPort: cfg.EncapDstPort,
+		}
+	}
+
+	// 生命周期
+	state.Limits.TimeHard = cfg.TimeLimitHard
+	state.Limits.TimeSoft = cfg.TimeLimitSoft
+
+	// Replay Window
+	if cfg.ReplayWindow > 0 {
+		state.ReplayWindow = cfg.ReplayWindow
+	} else {
+		state.ReplayWindow = 32 // Default
+	}
+
+	// SA 方向标记（Linux 6.x+）
+	if cfg.SADir != 0 {
+		state.SADir = cfg.SADir
+	}
+
+	// 扩展序列号（ESN）
+	state.ESN = cfg.ESN
+
+	return state
+}
+
+// buildXfrmPolicy 根据配置构建 netlink.XfrmPolicy 对象
+func (x *XFRMManager) buildXfrmPolicy(cfg XFRMSPConfig) *netlink.XfrmPolicy {
+	policy := &netlink.XfrmPolicy{
+		Src:  cfg.Src,
+		Dst:  cfg.Dst,
+		Dir:  cfg.Dir,
+		Ifid: cfg.Ifid,
+	}
+
+	tmpl := netlink.XfrmPolicyTmpl{
+		Src:   cfg.TmplSrc,
+		Dst:   cfg.TmplDst,
+		Proto: cfg.TmplProto,
+		Mode:  cfg.TmplMode,
+		Spi:   cfg.TmplSPI,
+	}
+	policy.Tmpls = []netlink.XfrmPolicyTmpl{tmpl}
+	return policy
 }

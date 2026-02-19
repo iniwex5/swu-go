@@ -6,23 +6,24 @@ package ikev2
 type PayloadType uint8
 
 const (
-	NoNextPayload PayloadType = 0
-	SA            PayloadType = 33
-	KE            PayloadType = 34
-	IDi           PayloadType = 35
-	IDr           PayloadType = 36
-	CERT          PayloadType = 37
-	CERTREQ       PayloadType = 38
-	AUTH          PayloadType = 39
-	NiNr          PayloadType = 40
-	N             PayloadType = 41
-	D             PayloadType = 42
-	V             PayloadType = 43
-	TSI           PayloadType = 44
-	TSR           PayloadType = 45
-	SK            PayloadType = 46
-	CP            PayloadType = 47
-	EAP           PayloadType = 48
+	NoNextPayload     PayloadType = 0
+	SA                PayloadType = 33
+	KE                PayloadType = 34
+	IDi               PayloadType = 35
+	IDr               PayloadType = 36
+	CERT              PayloadType = 37
+	CERTREQ           PayloadType = 38
+	AUTH              PayloadType = 39
+	NiNr              PayloadType = 40
+	N                 PayloadType = 41
+	D                 PayloadType = 42
+	V                 PayloadType = 43
+	TSI               PayloadType = 44
+	TSR               PayloadType = 45
+	SK                PayloadType = 46
+	CP                PayloadType = 47
+	EAP               PayloadType = 48
+	EncryptedFragment PayloadType = 53 // RFC 7383
 )
 
 // 交换类型
@@ -162,7 +163,27 @@ const (
 	REKEY_SA                      uint16 = 16393
 	ESP_TFC_PADDING_NOT_SUPPORTED uint16 = 16394
 	NON_FIRST_FRAGMENTS_ALSO      uint16 = 16395
-	EAP_ONLY_AUTHENTICATION       uint16 = 16417
-	DEVICE_IDENTITY               uint16 = 16407
-	DEVICE_IDENTITY_3GPP          uint16 = 41101
+	// MOBIKE (RFC 4555) — 按 IANA IKEv2 Parameters Registry 排列
+	MOBIKE_SUPPORTED        uint16 = 16396 // RFC 4555: 移动性支持能力协商
+	ADDITIONAL_IP4_ADDRESS  uint16 = 16397 // RFC 4555: 备用 IPv4 地址
+	ADDITIONAL_IP6_ADDRESS  uint16 = 16398 // RFC 4555: 备用 IPv6 地址
+	NO_ADDITIONAL_ADDRESSES uint16 = 16399 // RFC 4555: 无更多备用地址
+	UPDATE_SA_ADDRESSES     uint16 = 16400 // RFC 4555: 更新 SA 端点地址
+	COOKIE2                 uint16 = 16401 // RFC 4555: 路径验证 Cookie
+	NO_NATS_ALLOWED         uint16 = 16402 // RFC 4555: 禁止 NAT
+
+	AUTH_LIFETIME uint16 = 16403 // RFC 4478: ePDG 通告 IKE SA 最大生命周期（秒）
+
+	REDIRECT_SUPPORTED uint16 = 16406 // RFC 5685: 支持重定向
+	REDIRECT           uint16 = 16407 // RFC 5685: 重定向到其他网关
+
+	EAP_ONLY_AUTHENTICATION uint16 = 16417 // RFC 5998: 仅 EAP 认证
+
+	IKEV2_MESSAGE_ID_SYNC uint16 = 16422 // RFC 6311: 消息 ID 同步
+
+	// IKE Fragmentation (RFC 7383)
+	IKEV2_FRAGMENTATION_SUPPORTED uint16 = 16430
+
+	DEVICE_IDENTITY      uint16 = 16432 // 3GPP TS 24.302: 设备身份
+	DEVICE_IDENTITY_3GPP uint16 = 41101 // 3GPP 私有: 设备身份（IMEI）
 )

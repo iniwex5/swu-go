@@ -57,10 +57,15 @@ func (s *Session) sendDeleteChildSA(spis []uint32) error {
 }
 
 // StartDPD 启动 DPD 后台任务
+// 连续 dpdMaxFail 次失败触发 session down
 func (s *Session) StartDPD(interval time.Duration) {
+	const dpdMaxFail = 3
+
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+
+		failCount := 0
 
 		for {
 			select {
@@ -68,7 +73,26 @@ func (s *Session) StartDPD(interval time.Duration) {
 				return
 			case <-ticker.C:
 				if err := s.sendDPD(); err != nil {
-					s.Logger.Warn("DPD 发送失败", logger.Err(err))
+					failCount++
+					s.Logger.Warn("DPD 发送失败",
+						logger.Err(err),
+						logger.Int("连续失败", failCount))
+
+					if failCount >= dpdMaxFail {
+						s.Logger.Error("DPD 连续失败达上限，判定对端不可达",
+							logger.Int("maxFail", dpdMaxFail))
+						if s.OnSessionDown != nil {
+							go s.OnSessionDown()
+						} else if s.cancel != nil {
+							s.cancel()
+						}
+						return
+					}
+				} else {
+					if failCount > 0 {
+						s.Logger.Info("DPD 恢复正常", logger.Int("之前连续失败", failCount))
+					}
+					failCount = 0
 				}
 			}
 		}

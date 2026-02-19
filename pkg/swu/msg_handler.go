@@ -6,6 +6,7 @@ import (
 
 	"github.com/iniwex5/swu-go/pkg/crypto"
 	"github.com/iniwex5/swu-go/pkg/ikev2"
+	"github.com/iniwex5/swu-go/pkg/logger"
 )
 
 func (s *Session) decryptAndParse(data []byte) (uint32, []ikev2.Payload, error) {
@@ -14,6 +15,37 @@ func (s *Session) decryptAndParse(data []byte) (uint32, []ikev2.Payload, error) 
 		return 0, nil, err
 	}
 	s.SPIr = header.SPIr
+
+	// RFC 7383: 处理 Encrypted Fragment (SKF) 载荷
+	if header.NextPayload == ikev2.EncryptedFragment {
+		plaintext, fragNum, totalFrags, msgID, err := s.decryptSKF(data)
+		if err != nil {
+			return header.MessageID, nil, fmt.Errorf("SKF 解密失败: %v", err)
+		}
+		s.Logger.Debug("收到 IKE 分片",
+			logger.Int("frag", int(fragNum)),
+			logger.Int("total", int(totalFrags)),
+			logger.Uint32("msgID", msgID))
+
+		complete, err := s.fragmentBuf.addFragment(msgID, fragNum, totalFrags, plaintext)
+		if err != nil {
+			return msgID, nil, err
+		}
+		if !complete {
+			// 还没收齐，返回空载荷（调用方会继续接收）
+			return msgID, nil, nil
+		}
+		// 所有分片已收齐，重组
+		reassembled, err := s.fragmentBuf.reassemble(msgID)
+		if err != nil {
+			return msgID, nil, err
+		}
+		// 解析第一个分片中记录的 NextPayload 类型
+		// SKF Generic Header 中的 NextPayload 指向重组后的第一个载荷
+		firstPayloadType := ikev2.PayloadType(data[ikev2.IKE_HEADER_LEN])
+		payloads, err := s.parsePayloads(reassembled, firstPayloadType)
+		return msgID, payloads, err
+	}
 
 	if header.NextPayload != ikev2.SK {
 		packet, err := ikev2.DecodePacket(data)
@@ -123,6 +155,8 @@ func (s *Session) parsePayloads(data []byte, firstType ikev2.PayloadType) ([]ike
 			p, err = ikev2.DecodePayloadTS(body, false)
 		case ikev2.N:
 			p, err = ikev2.DecodePayloadNotify(body)
+		case ikev2.NiNr:
+			p, err = ikev2.DecodePayloadNonce(body)
 		default:
 			p = &ikev2.RawPayload{PType: nextType, Data: body}
 		}

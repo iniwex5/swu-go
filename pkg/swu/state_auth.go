@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/iniwex5/swu-go/pkg/crypto"
 	"github.com/iniwex5/swu-go/pkg/eap"
@@ -83,11 +84,17 @@ func (s *Session) buildIKEAuthInitPayloads() ([]ikev2.Payload, error) {
 	propCBC := ikev2.NewProposal(1, ikev2.ProtoESP, spiBytes)
 	propCBC.AddTransformWithKeyLen(ikev2.TransformTypeEncr, ikev2.ENCR_AES_CBC, 128)
 	propCBC.AddTransform(ikev2.TransformTypeInteg, ikev2.AUTH_HMAC_SHA2_256_128, 0)
-	propCBC.AddTransform(ikev2.TransformTypeESN, 0, 0)
+	if s.cfg.EnableESN {
+		propCBC.AddTransform(ikev2.TransformTypeESN, 1, 0) // ESN
+	}
+	propCBC.AddTransform(ikev2.TransformTypeESN, 0, 0) // NO_ESN (fallback)
 
 	propGCM := ikev2.NewProposal(2, ikev2.ProtoESP, spiBytes)
 	propGCM.AddTransformWithKeyLen(ikev2.TransformTypeEncr, ikev2.ENCR_AES_GCM_16, 128)
-	propGCM.AddTransform(ikev2.TransformTypeESN, 0, 0)
+	if s.cfg.EnableESN {
+		propGCM.AddTransform(ikev2.TransformTypeESN, 1, 0) // ESN
+	}
+	propGCM.AddTransform(ikev2.TransformTypeESN, 0, 0) // NO_ESN (fallback)
 
 	saPayload := &ikev2.EncryptedPayloadSA{
 		Proposals: []*ikev2.Proposal{propCBC, propGCM},
@@ -111,7 +118,13 @@ func (s *Session) buildIKEAuthInitPayloads() ([]ikev2.Payload, error) {
 		NotifyType: ikev2.EAP_ONLY_AUTHENTICATION,
 	}
 
-	payloads := []ikev2.Payload{idPayload, idrPayload, cpPayload, saPayload, tsPayloadI, tsPayloadR, notifyPayload}
+	// MOBIKE_SUPPORTED (RFC 4555)
+	mobikePayload := &ikev2.EncryptedPayloadNotify{
+		ProtocolID: 0,
+		NotifyType: ikev2.MOBIKE_SUPPORTED,
+	}
+
+	payloads := []ikev2.Payload{idPayload, idrPayload, cpPayload, saPayload, tsPayloadI, tsPayloadR, notifyPayload, mobikePayload}
 	if p, ok := s.cfg.SIM.(sim.IMEIProvider); ok {
 		if imei, err := p.GetIMEI(); err == nil && imei != "" {
 			data := append([]byte{0x01}, []byte(imei)...)
@@ -497,6 +510,32 @@ func (s *Session) handleIKEAuthFinalResp(data []byte) error {
 			if p.NotifyType < 16384 {
 				return fmt.Errorf("IKE_AUTH 返回错误通知: type=%d proto=%d spi=%x data=%x", p.NotifyType, p.ProtocolID, p.SPI, p.NotifyData)
 			}
+			// 打印所有收到的状态类型 Notify，便于调试
+			s.Logger.Debug("IKE_AUTH 收到状态 Notify",
+				logger.Int("type", int(p.NotifyType)),
+				logger.Int("dataLen", len(p.NotifyData)))
+			// RFC 4478: AUTH_LIFETIME — ePDG 通告 IKE SA 最大生存时间（秒）
+			if p.NotifyType == ikev2.AUTH_LIFETIME && len(p.NotifyData) >= 4 {
+				lifetime := binary.BigEndian.Uint32(p.NotifyData[:4])
+				s.authLifetime = lifetime
+				s.Logger.Info("ePDG 通告 AUTH_LIFETIME",
+					logger.Uint32("seconds", lifetime),
+					logger.String("duration", (time.Duration(lifetime)*time.Second).String()))
+			}
+			// RFC 5685: REDIRECT
+			if p.NotifyType == ikev2.REDIRECT {
+				addr, err := parseRedirectData(p.NotifyData)
+				if err != nil {
+					s.Logger.Warn("解析 REDIRECT 数据失败", logger.Err(err))
+				} else {
+					return &RedirectError{NewAddr: addr}
+				}
+			}
+			// RFC 4555: MOBIKE_SUPPORTED
+			if p.NotifyType == ikev2.MOBIKE_SUPPORTED {
+				s.mobikeSupported = true
+				s.Logger.Info("ePDG 支持 MOBIKE")
+			}
 		}
 	}
 
@@ -528,6 +567,11 @@ func (s *Session) handleIKEAuthFinalResp(data []byte) error {
 		}
 		if t.Type == ikev2.TransformTypeDH {
 			dhID = uint16(t.ID)
+		}
+		// ESN Transform: ID=1 表示使用 ESN，ID=0 表示不使用
+		if t.Type == ikev2.TransformTypeESN && t.ID == 1 {
+			s.childESN = true
+			s.Logger.Info("ePDG 选择了 ESN (扩展序列号)")
 		}
 	}
 	if encrID == 0 {

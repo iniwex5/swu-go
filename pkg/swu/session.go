@@ -5,18 +5,27 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 
 	"sync"
 	"time"
 
 	"github.com/iniwex5/netlink"
+	"github.com/iniwex5/netlink/nl"
 	"github.com/iniwex5/swu-go/pkg/crypto"
 	"github.com/iniwex5/swu-go/pkg/driver"
 	"github.com/iniwex5/swu-go/pkg/ikev2"
 	"github.com/iniwex5/swu-go/pkg/ipsec"
 	"github.com/iniwex5/swu-go/pkg/logger"
 	"go.uber.org/zap"
+)
+
+// SA 生命周期常量（秒）
+const (
+	ikeRekeyInterval   = 360 // 6 分钟：主动 IKE SA Rekey
+	childRekeyInterval = 420 // 7 分钟：主动 Child SA Rekey（在 ePDG ~8 分钟 ESP SA 过期前）
+	childRekeyJitter   = 30  // 最大 30 秒随机 jitter，避免多设备同时 Rekey
 )
 
 type Session struct {
@@ -51,6 +60,7 @@ type Session struct {
 	childEncrID         uint16 // Child SA 加密算法 ID (用于 XFRM 映射)
 	childIntegID        uint16 // Child SA 完整性算法 ID
 	childEncrKeyLenBits int    // Child SA 加密密钥位数
+	childESN            bool   // Child SA 是否使用 ESN (扩展序列号)
 
 	natKeepaliveStarted bool
 
@@ -61,7 +71,31 @@ type Session struct {
 	xfrmMgr  *driver.XFRMManager // XFRMI 模式下的 XFRM 管理器
 	done     chan struct{}       // 清理完成信号（Run() 返回前关闭）
 
+	// XFRM SA 上下文（setupXFRMDataPlane 时缓存，rekey 时复用）
+	xfrmLocalIP    net.IP
+	xfrmRemoteIP   net.IP
+	xfrmLocalPort  int
+	xfrmRemotePort int
+	xfrmIfID       int
+
+	// 隧道断线回调（Hard Expire / DPD 连续失败时调用）
+	OnSessionDown func()
+
+	// Rekey 互斥锁（防止两个 SPI 的 expire 同时触发）
+	rekeyMu sync.Mutex
+	// 上次成功 Rekey 的时间（用于冷却期去重）
+	lastRekeyTime time.Time
+	// IKE SA Rekey 成功后通知 Timer 重置的 channel
+	rekeyResetCh chan struct{}
+	// Child SA Rekey 成功后通知 Timer 重置的 channel
+	childRekeyResetCh chan struct{}
+
+	// ePDG 通告的 IKE SA 最大生命周期（秒），通过 AUTH_LIFETIME Notify 获取
+	// 0 表示 ePDG 未通告，使用默认的硬编码值
+	authLifetime uint32
+
 	childOutPolicies []childOutPolicy
+	xfrmPolicies     []driver.XFRMSPConfig // 缓存所有 XFRM SP（MOBIKE 地址更新时使用）
 
 	ikeMu           sync.Mutex
 	ikeStarted      bool
@@ -82,9 +116,14 @@ type Session struct {
 	cookie     []byte // ePDG 返回的 COOKIE
 	sendCookie bool   // 标记是否需要发送 COOKIE
 
+	mobikeSupported        bool            // 对端是否支持 MOBIKE (RFC 4555)
+	fragmentationSupported bool            // 对端是否支持 IKE Fragmentation (RFC 7383)
+	fragmentBuf            *fragmentBuffer // IKE Fragmentation 接收缓冲区
+
 	// 生命周期管理
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx           context.Context
+	cancel        context.CancelFunc
+	reauthTrigger chan struct{} // 触发 Reauth 的信号通道
 
 	retryCtx *RetryContext
 
@@ -101,7 +140,19 @@ type ikeWaitKey struct {
 type childOutPolicy struct {
 	saOut *ipsec.SecurityAssociation
 	tsr   []*ikev2.TrafficSelector
+	cfg   driver.XFRMSPConfig // SP 配置缓存（MOBIKE 地址更新时使用）
 }
+
+// RedirectError 表示 ePDG 要求重定向
+type RedirectError struct {
+	NewAddr string
+}
+
+func (e *RedirectError) Error() string {
+	return fmt.Sprintf("ePDG requested redirect to: %s", e.NewAddr)
+}
+
+var ErrReauth = errors.New("reauthentication triggered")
 
 func NewSession(cfg *Config, l *zap.Logger) *Session {
 	if l == nil {
@@ -129,12 +180,52 @@ func NewSession(cfg *Config, l *zap.Logger) *Session {
 		ikePending:       make(map[ikeWaitKey][]byte),
 		childOutPolicies: make([]childOutPolicy, 0),
 		done:             make(chan struct{}),
+		reauthTrigger:    make(chan struct{}, 1),
+		fragmentBuf:      newFragmentBuffer(),
 	}
 }
 
-// Connect 连接到 ePDG，使用提供的 context 进行生命周期管理
+// Connect 连接到 ePDG，支持 REDIRECT 重连和 Reauthentication
 func (s *Session) Connect(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
+	const maxRedirects = 3
+	redirectCount := 0
+
+	for {
+		err := s.connectOnce()
+		if err == nil {
+			return nil
+		}
+
+		// 检查 Reauth 信号
+		if errors.Is(err, ErrReauth) {
+			s.Logger.Info("Reauthentication: 重新开始连接流程")
+			// 重置 Redirect 计数，因为这是全新的连接尝试
+			redirectCount = 0
+			// 不关闭 Socket? connectOnce 已经负责清理了上一轮的资源
+			// 但我们希望保留某些状态吗？不，Reauth 是全新的 IKE SA。
+			continue
+		}
+
+		// 检查是否是重定向错误
+		if redir, ok := err.(*RedirectError); ok {
+			if redirectCount >= maxRedirects {
+				return fmt.Errorf("exceeded max redirects (%d)", maxRedirects)
+			}
+			redirectCount++
+			s.Logger.Info("收到 REDIRECT 请求，正在重连",
+				logger.String("newAddr", redir.NewAddr),
+				logger.Int("attempt", redirectCount))
+
+			s.cfg.EpDGAddr = redir.NewAddr
+			continue
+		}
+		return err
+	}
+}
+
+// connectOnce 执行一次完整的 IKE 连接流程
+func (s *Session) connectOnce() error {
 	handshakeStart := time.Now()
 	var err error
 	s.retryCtx = NewRetryContext(s.ctx, nil)
@@ -339,19 +430,92 @@ func (s *Session) Connect(ctx context.Context) error {
 
 	s.startIKEControlLoop()
 
-	// 等待 context 取消 (优雅关闭)
-	<-s.ctx.Done()
-	s.Logger.Info("收到关闭信号，正在清理")
+	// 计算 Rekey 间隔：如果 ePDG 通告了 AUTH_LIFETIME，动态调整
+	ikeInterval := time.Duration(ikeRekeyInterval) * time.Second
+	childInterval := time.Duration(childRekeyInterval) * time.Second
+	if s.authLifetime > 0 {
+		// IKE Rekey 间隔 = AUTH_LIFETIME 的 80%，在 ePDG 强制删除前完成
+		ikeInterval = time.Duration(float64(s.authLifetime)*0.8) * time.Second
+		// Child Rekey 间隔 = AUTH_LIFETIME 的 87.5%，在 IKE Rekey 前先刷新 ESP
+		childInterval = time.Duration(float64(s.authLifetime)*0.875) * time.Second
+		s.Logger.Info("根据 AUTH_LIFETIME 动态调整 Rekey 间隔",
+			logger.Uint32("authLifetime", s.authLifetime),
+			logger.Duration("ikeRekey", ikeInterval),
+			logger.Duration("childRekey", childInterval))
+	}
 
-	// 发送 IKE SA Delete 通知
-	if err := s.sendDeleteIKE(); err != nil {
-		s.Logger.Warn("发送 Delete 通知失败", logger.Err(err))
+	// 启动 IKE SA 生命周期管理：定时触发 IKE SA Rekey
+	s.startIKESARekeyTimer(ikeInterval)
+
+	// 启动 Child SA 生命周期管理：定时触发 Child SA Rekey
+	// 参考 strongSwan rekey_child_sa_job：在 ePDG ESP SA 过期前刷新
+	s.startChildSARekeyTimer(childInterval)
+
+	// 启动 Reauth Timer (如果配置了)
+	if s.cfg.ReauthInterval > 0 {
+		s.startIKEReauthTimer(time.Duration(s.cfg.ReauthInterval) * time.Second)
+	}
+
+	// 启动 XFRM SA Expire 内核事件监听（仅做日志+Hard Expire 处理）
+	s.startXFRMExpireMonitor()
+
+	// 等待 context 取消 (优雅关闭) 或 Reauth 触发
+	select {
+	case <-s.ctx.Done():
+		s.Logger.Info("收到关闭信号，正在清理")
+	case <-s.reauthTrigger:
+		s.Logger.Info("触发 IKE Reauthentication，正在断开旧连接")
+		// 发送 Delete 通知
+		if err := s.sendDeleteIKE(); err != nil {
+			s.Logger.Warn("发送 Delete 通知失败", logger.Err(err))
+		}
+		// 返回 ErrReauth 信号
+		err = ErrReauth
+	}
+
+	if err != ErrReauth {
+		// 仅在非 Reauth（正常关闭）时发送 Delete
+		if err := s.sendDeleteIKE(); err != nil {
+			s.Logger.Warn("发送 Delete 通知失败", logger.Err(err))
+		}
 	}
 
 	s.cleanupNetworkConfig()
 	close(s.done) // 通知外部清理已完成
 
+	if err == ErrReauth {
+		return err
+	}
 	return s.ctx.Err()
+}
+
+// Reauthenticate 触发完全重认证 (RFC 7296 §2.8.3)
+// 实现 Break-Before-Make
+func (s *Session) Reauthenticate() {
+	select {
+	case s.reauthTrigger <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Session) startIKEReauthTimer(interval time.Duration) {
+	s.Logger.Info("启动 IKE SA Reauth 定时器", logger.Duration("interval", interval))
+	go func() {
+		// 添加抖动 (0-10%)
+		jitter := time.Duration(rand.Int63n(int64(interval / 10)))
+		timer := time.NewTimer(interval + jitter)
+		defer timer.Stop()
+
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-timer.C:
+				s.Reauthenticate()
+				return
+			}
+		}
+	}()
 }
 
 // WaitDone 阻塞等待 Session 清理完成（Run 返回前的 cleanup 执行完毕）
@@ -383,27 +547,27 @@ func (s *Session) logSessionStats(interval time.Duration) {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
-			stats := s.retryCtx.Stats()
-			s.Logger.Debug("会话统计",
-				logger.Uint64("spii", s.SPIi),
-				logger.Uint64("spir", s.SPIr),
-				logger.Uint64("attempts", stats.TotalAttempts),
-				logger.Uint64("timeouts", stats.TotalTimeouts),
-				logger.Uint64("success", stats.TotalSuccess),
-				logger.Uint64("failures", stats.TotalFailures),
-			)
+			// stats := s.retryCtx.Stats()
+			// s.Logger.Debug("会话统计",
+			// 	logger.Uint64("spii", s.SPIi),
+			// 	logger.Uint64("spir", s.SPIr),
+			// 	logger.Uint64("attempts", stats.TotalAttempts),
+			// 	logger.Uint64("timeouts", stats.TotalTimeouts),
+			// 	logger.Uint64("success", stats.TotalSuccess),
+			// 	logger.Uint64("failures", stats.TotalFailures),
+			// )
 
-			if sm, ok := s.socket.(*ipsec.SocketManager); ok {
-				sockStats := sm.Stats()
-				s.Logger.Debug("Socket 统计",
-					logger.Uint64("spii", s.SPIi),
-					logger.Uint64("spir", s.SPIr),
-					logger.Uint64("ikeRecv", sockStats.ReceivedIKE),
-					logger.Uint64("espRecv", sockStats.ReceivedESP),
-					logger.Uint64("ikeDrop", sockStats.DroppedIKE),
-					logger.Uint64("espDrop", sockStats.DroppedESP),
-				)
-			}
+			// if sm, ok := s.socket.(*ipsec.SocketManager); ok {
+			// 	sockStats := sm.Stats()
+			// 	s.Logger.Debug("Socket 统计",
+			// 		logger.Uint64("spii", s.SPIi),
+			// 		logger.Uint64("spir", s.SPIr),
+			// 		logger.Uint64("ikeRecv", sockStats.ReceivedIKE),
+			// 		logger.Uint64("espRecv", sockStats.ReceivedESP),
+			// 		logger.Uint64("ikeDrop", sockStats.DroppedIKE),
+			// 		logger.Uint64("espDrop", sockStats.DroppedESP),
+			// 	)
+			// }
 		}
 	}
 }
@@ -429,6 +593,205 @@ func (s *Session) startNATKeepalive(interval time.Duration) {
 			case <-ticker.C:
 				if err := sender.SendNATKeepalive(); err != nil {
 					s.Logger.Debug("NAT keepalive 发送失败", logger.Err(err))
+				}
+			}
+		}
+	}()
+}
+
+// startIKESARekeyTimer 启动 IKE SA 生命周期管理
+// 定期触发 IKE SA Rekey，在 ePDG 8 分钟超时前刷新整个 IKE SA
+// 连续失败 rekeyMaxFail 次后触发隧道重建
+func (s *Session) startIKESARekeyTimer(interval time.Duration) {
+	const rekeyMaxFail = 2
+
+	// 初始化 rekey 重置 channel
+	s.rekeyResetCh = make(chan struct{}, 1)
+
+	go func() {
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
+
+		failCount := 0
+
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-s.rekeyResetCh:
+				// IKE SA Rekey 成功，重置计时器
+				failCount = 0
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(interval)
+				s.Logger.Debug("IKE SA Rekey 成功，Timer 已重置",
+					logger.Duration("interval", interval))
+			case <-timer.C:
+				s.Logger.Info("IKE SA 生命周期到期，发起主动 IKE SA Rekey",
+					logger.Duration("interval", interval))
+				if err := s.RekeyIKESA(); err != nil {
+					failCount++
+					s.Logger.Warn("IKE SA Rekey 失败",
+						logger.Err(err),
+						logger.Int("连续失败", failCount))
+
+					if failCount >= rekeyMaxFail {
+						s.Logger.Error("IKE SA Rekey 连续失败达上限，触发隧道重建",
+							logger.Int("maxFail", rekeyMaxFail))
+						if s.OnSessionDown != nil {
+							go s.OnSessionDown()
+						} else if s.cancel != nil {
+							s.cancel()
+						}
+						return
+					}
+					timer.Reset(60 * time.Second)
+				} else {
+					failCount = 0
+					timer.Reset(interval)
+				}
+			}
+		}
+	}()
+}
+
+// startChildSARekeyTimer 启动 Child SA 生命周期管理
+// 定期触发 CHILD_SA Rekey，在 ePDG ~8 分钟 ESP SA 过期前刷新密钥
+// 连续失败 rekeyMaxFail 次后触发隧道重建
+// 参考 strongSwan rekey_child_sa_job + jitter 机制
+func (s *Session) startChildSARekeyTimer(interval time.Duration) {
+	const rekeyMaxFail = 2
+
+	// 初始化 child rekey 重置 channel
+	s.childRekeyResetCh = make(chan struct{}, 1)
+
+	go func() {
+		// 首次启动添加 jitter，避免多设备同时 Rekey
+		jitter := time.Duration(rand.Int63n(int64(childRekeyJitter))) * time.Second
+		timer := time.NewTimer(interval - jitter)
+		defer timer.Stop()
+
+		failCount := 0
+
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-s.childRekeyResetCh:
+				// Child SA Rekey 成功（主动/被动），重置计时器
+				failCount = 0
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				jitter = time.Duration(rand.Int63n(int64(childRekeyJitter))) * time.Second
+				timer.Reset(interval - jitter)
+				s.Logger.Debug("Child SA Rekey Timer 已重置",
+					logger.Duration("interval", interval-jitter))
+			case <-timer.C:
+				s.Logger.Info("Child SA 生命周期到期，发起主动 Child SA Rekey",
+					logger.Duration("interval", interval))
+				if err := s.RekeyChildSA(); err != nil {
+					failCount++
+					s.Logger.Warn("Child SA Rekey 失败",
+						logger.Err(err),
+						logger.Int("连续失败", failCount))
+
+					if failCount >= rekeyMaxFail {
+						s.Logger.Error("Child SA Rekey 连续失败达上限，触发隧道重建",
+							logger.Int("maxFail", rekeyMaxFail))
+						if s.OnSessionDown != nil {
+							go s.OnSessionDown()
+						} else if s.cancel != nil {
+							s.cancel()
+						}
+						return
+					}
+					timer.Reset(60 * time.Second) // 失败后 1 分钟重试
+				} else {
+					failCount = 0
+					jitter = time.Duration(rand.Int63n(int64(childRekeyJitter))) * time.Second
+					timer.Reset(interval - jitter)
+				}
+			}
+		}
+	}()
+}
+
+// startXFRMExpireMonitor 监听内核 XFRM_MSG_EXPIRE 事件
+// Soft Expire: SA 接近过期，触发主动 Child SA Rekey
+// Hard Expire: SA 已过期，触发隧道重建
+func (s *Session) startXFRMExpireMonitor() {
+	if s.xfrmMgr == nil {
+		return
+	}
+
+	ch := make(chan netlink.XfrmMsg)
+	done := make(chan struct{})
+	errCh := make(chan error, 1)
+
+	if err := netlink.XfrmMonitor(ch, done, errCh, nl.XFRM_MSG_EXPIRE); err != nil {
+		s.Logger.Warn("启动 XFRM Expire 监听失败", logger.Err(err))
+		return
+	}
+
+	s.Logger.Info("XFRM SA Expire 监听已启动")
+
+	go func() {
+		defer close(done)
+
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case err := <-errCh:
+				s.Logger.Warn("XFRM 监听错误", logger.Err(err))
+				return
+			case msg, ok := <-ch:
+				if !ok {
+					return
+				}
+				expire, ok := msg.(*netlink.XfrmMsgExpire)
+				if !ok || expire.XfrmState == nil {
+					continue
+				}
+
+				// 过滤：只处理本 session 的 SA
+				spi := uint32(expire.XfrmState.Spi)
+				isOurSA := false
+				if s.ChildSAOut != nil && s.ChildSAOut.SPI == spi {
+					isOurSA = true
+				}
+				if s.ChildSAIn != nil && s.ChildSAIn.SPI == spi {
+					isOurSA = true
+				}
+				if !isOurSA {
+					continue
+				}
+
+				if expire.Hard {
+					s.Logger.Warn("XFRM SA Hard Expire，触发隧道重建",
+						logger.Uint32("spi", spi))
+					if s.OnSessionDown != nil {
+						go s.OnSessionDown()
+					} else if s.cancel != nil {
+						s.cancel()
+					}
+				} else {
+					// Soft Expire 触发主动 Child SA Rekey
+					s.Logger.Info("XFRM SA Soft Expire，触发主动 Child SA Rekey",
+						logger.Uint32("spi", spi))
+					go func() {
+						if err := s.RekeyChildSA(); err != nil {
+							s.Logger.Warn("Soft Expire 触发 Rekey 失败", logger.Err(err))
+						}
+					}()
 				}
 			}
 		}
@@ -612,30 +975,40 @@ func (s *Session) setupXFRMDataPlane() error {
 
 	// 出站 SA (本端 → ePDG)
 	outSACfg := driver.XFRMSAConfig{
-		Src:          localIP,
-		Dst:          remoteIP,
-		SPI:          s.ChildSAOut.SPI,
-		Proto:        netlink.XFRM_PROTO_ESP,
-		Mode:         netlink.XFRM_MODE_TUNNEL,
-		IsAEAD:       isAEAD,
-		EncapType:    netlink.XFRM_ENCAP_ESPINUDP,
-		EncapSrcPort: localPort,
-		EncapDstPort: remotePort,
-		Ifid:         int(xfrmIfID),
+		Src:           localIP,
+		Dst:           remoteIP,
+		SPI:           s.ChildSAOut.SPI,
+		Proto:         netlink.XFRM_PROTO_ESP,
+		Mode:          netlink.XFRM_MODE_TUNNEL,
+		IsAEAD:        isAEAD,
+		EncapType:     netlink.XFRM_ENCAP_ESPINUDP,
+		EncapSrcPort:  localPort,
+		EncapDstPort:  remotePort,
+		Ifid:          int(xfrmIfID),
+		TimeLimitSoft: 0, // 不设 expire（由 IKE SA Rekey 管理生命周期）
+		TimeLimitHard: 0,
+		ReplayWindow:  s.cfg.ReplayWindow,
+		SADir:         netlink.XFRM_SA_DIR_OUT,
+		ESN:           s.childESN,
 	}
 
 	// 入站 SA (ePDG → 本端)
 	inSACfg := driver.XFRMSAConfig{
-		Src:          remoteIP,
-		Dst:          localIP,
-		SPI:          s.ChildSAIn.SPI,
-		Proto:        netlink.XFRM_PROTO_ESP,
-		Mode:         netlink.XFRM_MODE_TUNNEL,
-		IsAEAD:       isAEAD,
-		EncapType:    netlink.XFRM_ENCAP_ESPINUDP,
-		EncapSrcPort: remotePort,
-		EncapDstPort: localPort,
-		Ifid:         int(xfrmIfID),
+		Src:           remoteIP,
+		Dst:           localIP,
+		SPI:           s.ChildSAIn.SPI,
+		Proto:         netlink.XFRM_PROTO_ESP,
+		Mode:          netlink.XFRM_MODE_TUNNEL,
+		IsAEAD:        isAEAD,
+		EncapType:     netlink.XFRM_ENCAP_ESPINUDP,
+		EncapSrcPort:  remotePort,
+		EncapDstPort:  localPort,
+		Ifid:          int(xfrmIfID),
+		TimeLimitSoft: 0,
+		TimeLimitHard: 0,
+		ReplayWindow:  s.cfg.ReplayWindow,
+		SADir:         netlink.XFRM_SA_DIR_IN,
+		ESN:           s.childESN,
 	}
 
 	// 配置算法参数
@@ -694,6 +1067,13 @@ func (s *Session) setupXFRMDataPlane() error {
 		logger.String("local", localIP.String()),
 		logger.String("remote", remoteIP.String()),
 	)
+
+	// 缓存网络参数供 rekey 时复用
+	s.xfrmLocalIP = localIP
+	s.xfrmRemoteIP = remoteIP
+	s.xfrmLocalPort = localPort
+	s.xfrmRemotePort = remotePort
+	s.xfrmIfID = int(xfrmIfID)
 
 	// 6. 安装 SP (出站和入站)
 	allIPv4 := &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}
@@ -780,6 +1160,9 @@ func (s *Session) setupXFRMDataPlane() error {
 
 	s.Logger.Debug("XFRM SP 已安装")
 
+	// 缓存所有 SP 配置（MOBIKE 地址更新时使用）
+	s.xfrmPolicies = []driver.XFRMSPConfig{outSP4, inSP4, fwdSP4, outSP6, inSP6}
+
 	// 7. 在 XFRM 接口上配置 IP 地址和路由
 	// 复用 applyNetworkConfigOnTUN (它只依赖接口名)
 	if err := s.net.SetLinkUp(xfrmIfName); err != nil {
@@ -807,6 +1190,136 @@ func (s *Session) setupXFRMDataPlane() error {
 		logger.String("iface", xfrmIfName),
 		logger.Uint32("ifID", xfrmIfID),
 		logger.Int("mtu", mtu))
+
+	return nil
+}
+
+// rekeyXFRMSA 在 CHILD_SA Rekey 后更新内核 XFRM SA 和 SP
+// 流程：删除旧 SA → 安装新 SA → 更新 SP 模板 SPI（通过 Update 语义）
+func (s *Session) rekeyXFRMSA(oldOutSPI, oldInSPI uint32, newSAOut, newSAIn *ipsec.SecurityAssociation, encrID uint16, encrKeyLenBits int) error {
+	xfrmMgr := s.xfrmMgr
+	if xfrmMgr == nil {
+		return nil
+	}
+
+	localIP := s.xfrmLocalIP
+	remoteIP := s.xfrmRemoteIP
+	localPort := s.xfrmLocalPort
+	remotePort := s.xfrmRemotePort
+	ifid := s.xfrmIfID
+
+	// 1. 删除旧 SA
+	_ = xfrmMgr.DelSA(oldOutSPI, localIP, remoteIP, netlink.XFRM_PROTO_ESP)
+	_ = xfrmMgr.DelSA(oldInSPI, remoteIP, localIP, netlink.XFRM_PROTO_ESP)
+
+	// 2. 构建新 SA 配置
+	isAEAD := driver.IsAEADAlgorithm(encrID)
+
+	outSACfg := driver.XFRMSAConfig{
+		Src:           localIP,
+		Dst:           remoteIP,
+		SPI:           newSAOut.SPI,
+		Proto:         netlink.XFRM_PROTO_ESP,
+		Mode:          netlink.XFRM_MODE_TUNNEL,
+		IsAEAD:        isAEAD,
+		EncapType:     netlink.XFRM_ENCAP_ESPINUDP,
+		EncapSrcPort:  localPort,
+		EncapDstPort:  remotePort,
+		Ifid:          ifid,
+		TimeLimitSoft: 0,
+		TimeLimitHard: 0,
+		ReplayWindow:  s.cfg.ReplayWindow,
+		SADir:         netlink.XFRM_SA_DIR_OUT,
+		ESN:           s.childESN,
+	}
+
+	inSACfg := driver.XFRMSAConfig{
+		Src:           remoteIP,
+		Dst:           localIP,
+		SPI:           newSAIn.SPI,
+		Proto:         netlink.XFRM_PROTO_ESP,
+		Mode:          netlink.XFRM_MODE_TUNNEL,
+		IsAEAD:        isAEAD,
+		EncapType:     netlink.XFRM_ENCAP_ESPINUDP,
+		EncapSrcPort:  remotePort,
+		EncapDstPort:  localPort,
+		Ifid:          ifid,
+		TimeLimitSoft: 0,
+		TimeLimitHard: 0,
+		ReplayWindow:  s.cfg.ReplayWindow,
+		SADir:         netlink.XFRM_SA_DIR_IN,
+		ESN:           s.childESN,
+	}
+
+	// 配置算法
+	if isAEAD {
+		aeadInfo, err := driver.IKEv2AlgToXFRMAead(encrID, encrKeyLenBits)
+		if err != nil {
+			return fmt.Errorf("Rekey 映射 AEAD 算法失败: %v", err)
+		}
+		outSACfg.AeadAlgoName = aeadInfo.Name
+		outSACfg.AeadKey = newSAOut.EncryptionKey
+		outSACfg.AeadICVLen = aeadInfo.ICVBits
+
+		inSACfg.AeadAlgoName = aeadInfo.Name
+		inSACfg.AeadKey = newSAIn.EncryptionKey
+		inSACfg.AeadICVLen = aeadInfo.ICVBits
+	} else {
+		cryptInfo, err := driver.IKEv2AlgToXFRMCrypt(encrID, encrKeyLenBits)
+		if err != nil {
+			return fmt.Errorf("Rekey 映射加密算法失败: %v", err)
+		}
+		authInfo, err := driver.IKEv2AlgToXFRMAuth(s.childIntegID)
+		if err != nil {
+			return fmt.Errorf("Rekey 映射完整性算法失败: %v", err)
+		}
+		outSACfg.CryptAlgoName = cryptInfo.Name
+		outSACfg.CryptKey = newSAOut.EncryptionKey
+		outSACfg.AuthAlgoName = authInfo.Name
+		outSACfg.AuthKey = newSAOut.IntegrityKey
+		outSACfg.AuthTruncLen = authInfo.TruncateBits
+
+		inSACfg.CryptAlgoName = cryptInfo.Name
+		inSACfg.CryptKey = newSAIn.EncryptionKey
+		inSACfg.AuthAlgoName = authInfo.Name
+		inSACfg.AuthKey = newSAIn.IntegrityKey
+		inSACfg.AuthTruncLen = authInfo.TruncateBits
+	}
+
+	// 3. 安装新 SA
+	if err := xfrmMgr.AddSA(outSACfg); err != nil {
+		return fmt.Errorf("Rekey 安装出站 SA 失败: %v", err)
+	}
+	if err := xfrmMgr.AddSA(inSACfg); err != nil {
+		return fmt.Errorf("Rekey 安装入站 SA 失败: %v", err)
+	}
+
+	// 4. 更新 SP 模板中的 SPI（使用 Update 语义覆盖旧 SP）
+	allIPv4 := &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}
+	allIPv6 := &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)}
+
+	// 出站 SP (IPv4 + IPv6)
+	for _, src := range []*net.IPNet{allIPv4, allIPv6} {
+		_ = xfrmMgr.AddSP(driver.XFRMSPConfig{
+			Src: src, Dst: src, Dir: netlink.XFRM_DIR_OUT,
+			TmplSrc: localIP, TmplDst: remoteIP,
+			TmplProto: netlink.XFRM_PROTO_ESP, TmplMode: netlink.XFRM_MODE_TUNNEL,
+			TmplSPI: int(newSAOut.SPI), Ifid: ifid,
+		})
+	}
+	// 入站 SP (IPv4 + IPv6)
+	for _, src := range []*net.IPNet{allIPv4, allIPv6} {
+		_ = xfrmMgr.AddSP(driver.XFRMSPConfig{
+			Src: src, Dst: src, Dir: netlink.XFRM_DIR_IN,
+			TmplSrc: remoteIP, TmplDst: localIP,
+			TmplProto: netlink.XFRM_PROTO_ESP, TmplMode: netlink.XFRM_MODE_TUNNEL,
+			TmplSPI: int(newSAIn.SPI), Ifid: ifid,
+		})
+	}
+
+	s.Logger.Debug("XFRM SA/SP 已更新 (Rekey)",
+		logger.Uint32("newOutSPI", newSAOut.SPI),
+		logger.Uint32("newInSPI", newSAIn.SPI))
 
 	return nil
 }
@@ -1220,6 +1733,28 @@ func (s *Session) sendEncryptedWithRetry(payloads []ikev2.Payload, exchangeType 
 	if s.retryCtx == nil {
 		return nil, errors.New("重传上下文未初始化")
 	}
+
+	// IKE Fragmentation (RFC 7383): 如果消息过大且对端支持分片，则分片发送
+	if s.shouldFragment(payloads) {
+		packets, err := s.fragmentMessage(payloads, exchangeType)
+		if err != nil {
+			return nil, fmt.Errorf("IKE 分片失败: %v", err)
+		}
+		if len(packets) > 0 {
+			// 分片模式: 发送所有分片，等待最后一个分片的响应
+			// 所有分片共享同一个 Message ID
+			msgID := s.SequenceNumber - 1
+			for _, pkt := range packets {
+				if err := s.socket.SendIKE(pkt); err != nil {
+					return nil, fmt.Errorf("发送 IKE 分片失败: %v", err)
+				}
+			}
+			// 等待响应
+			return s.receiveIKEResponseWithTimeout(exchangeType, msgID, 10*time.Second)
+		}
+	}
+
+	// 正常（非分片）发送
 	packetData, err := s.encryptAndWrap(payloads, exchangeType, false)
 	if err != nil {
 		return nil, err

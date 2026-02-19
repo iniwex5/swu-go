@@ -13,6 +13,7 @@ import (
 
 	"github.com/iniwex5/swu-go/pkg/crypto"
 	"github.com/iniwex5/swu-go/pkg/ikev2"
+	"github.com/iniwex5/swu-go/pkg/logger"
 )
 
 func detectOutboundIPv4(remoteIP net.IP, remotePort uint16) (net.IP, error) {
@@ -134,7 +135,16 @@ func (s *Session) buildIKESAInitPacket() ([]byte, error) {
 	dstHash := ikev2.CalculateNATDetectionHash(s.SPIi, 0, remoteIP, remotePort)
 	natDstPayload := ikev2.CreateNATDetectionNotify(ikev2.NAT_DETECTION_DESTINATION_IP, dstHash)
 
-	payloads := []ikev2.Payload{saPayload, kePayload, noncePayload}
+	// IKE Fragmentation (RFC 7383)
+	// IKE_SA_INIT 必须携带此通知
+	fragNotify := &ikev2.EncryptedPayloadNotify{
+		ProtocolID: 0,
+		NotifyType: ikev2.IKEV2_FRAGMENTATION_SUPPORTED,
+	}
+
+	// 顺序: SA, KE, Nonce, FRAG, [COOKIE], NAT_SRC, NAT_DST
+
+	payloads := []ikev2.Payload{saPayload, kePayload, noncePayload, fragNotify}
 	if s.sendCookie && len(s.cookie) > 0 {
 		payloads = append(payloads, &ikev2.EncryptedPayloadNotify{
 			ProtocolID: 0,
@@ -201,9 +211,23 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 			if v.NotifyType == ikev2.NAT_DETECTION_DESTINATION_IP {
 				natDst = v.NotifyData
 			}
+			// IKE Fragmentation (RFC 7383)
+			if v.NotifyType == ikev2.IKEV2_FRAGMENTATION_SUPPORTED {
+				s.fragmentationSupported = true
+				s.Logger.Info("ePDG 支持 IKE Fragmentation")
+			}
 			// 检查错误，如 NO_PROPOSAL_CHOSEN
 			if v.NotifyType == 14 { // NO_PROPOSAL_CHOSEN
 				return errors.New("服务器拒绝了提议 (NO_PROPOSAL_CHOSEN)")
+			}
+			// RFC 5685: REDIRECT
+			if v.NotifyType == ikev2.REDIRECT {
+				addr, err := parseRedirectData(v.NotifyData)
+				if err != nil {
+					s.Logger.Warn("解析 REDIRECT 数据失败", logger.Err(err))
+				} else {
+					return &RedirectError{NewAddr: addr}
+				}
 			}
 		}
 	}
@@ -328,4 +352,29 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 
 	s.sendCookie = false
 	return nil
+}
+
+func parseRedirectData(data []byte) (string, error) {
+	if len(data) < 1 {
+		return "", errors.New("empty redirect data")
+	}
+	gwType := data[0]
+	gwData := data[1:]
+
+	switch gwType {
+	case 1: // IPv4
+		if len(gwData) != 4 {
+			return "", fmt.Errorf("invalid IPv4 length: %d", len(gwData))
+		}
+		return net.IP(gwData).String(), nil
+	case 2: // IPv6
+		if len(gwData) != 16 {
+			return "", fmt.Errorf("invalid IPv6 length: %d", len(gwData))
+		}
+		return net.IP(gwData).String(), nil
+	case 3: // FQDN
+		return string(gwData), nil
+	default:
+		return "", fmt.Errorf("unknown gateway identity type: %d", gwType)
+	}
 }

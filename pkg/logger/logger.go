@@ -111,6 +111,12 @@ func initLogger(level, format string) error {
 	return nil
 }
 
+// SetLogger 设置外部 Logger（允许主应用注入自己的 logger）
+func SetLogger(l *zap.Logger) {
+	globalLogger = l
+	globalSugar = l.Sugar()
+}
+
 // Get 获取全局 Logger
 func Get() *zap.Logger {
 	if globalLogger == nil {
