@@ -18,12 +18,14 @@ type RetryConfig struct {
 }
 
 // DefaultRetryConfig 默认重传配置
+// 对齐 strongSwan 默认值 (retransmit_timeout=4s, retransmit_base=1.8, retransmit_tries=5)
+// 超时序列: 4s, 7.2s, 12.96s, 23.3s, 42s, 75.6s → 总计约 165s
 func DefaultRetryConfig() *RetryConfig {
 	return &RetryConfig{
-		MaxRetries:     3,
-		InitialTimeout: 2 * time.Second,
-		MaxTimeout:     8 * time.Second,
-		BackoffFactor:  2.0,
+		MaxRetries:     5,
+		InitialTimeout: 4 * time.Second,
+		MaxTimeout:     0, // 0 表示无上限，与 strongSwan retransmit_limit=0 一致
+		BackoffFactor:  1.8,
 	}
 }
 
@@ -105,9 +107,9 @@ func (rc *RetryContext) SendWithRetry(
 		if errors.Is(err, context.DeadlineExceeded) || isTimeoutError(err) {
 			atomic.AddUint64(&rc.totalTimeouts, 1)
 			rc.currentRetry++
-			// 指数退避
+			// 指数退避: timeout = initialTimeout * (backoffFactor ^ try)
 			rc.currentTimeout = time.Duration(float64(rc.currentTimeout) * rc.config.BackoffFactor)
-			if rc.currentTimeout > rc.config.MaxTimeout {
+			if rc.config.MaxTimeout > 0 && rc.currentTimeout > rc.config.MaxTimeout {
 				rc.currentTimeout = rc.config.MaxTimeout
 			}
 			logger.Debug("超时，准备重传")

@@ -40,6 +40,9 @@ func (s *Session) ikeDispatchLoop() {
 				return
 			}
 
+			// 更新入站时间戳（对齐 strongSwan stats[STAT_INBOUND]）
+			s.lastInboundTime = time.Now()
+
 			hdr, err := ikev2.DecodeHeader(data)
 			if err != nil {
 				continue
@@ -236,10 +239,16 @@ func (s *Session) handleIncomingInformational(data []byte) error {
 			continue
 		}
 
+		// 收集需要回复的本端出站 SPI（对齐 strongSwan delete_child_sa 行为）
+		var deletedLocalSPIs []uint32
 		for i := 0; i+4 <= len(del.SPIs); i += 4 {
 			spi := binary.BigEndian.Uint32(del.SPIs[i : i+4])
 			s.Logger.Warn("收到 ePDG 发起的 Child SA Delete",
 				logger.Uint32("spi", spi))
+			// 查找对应本端出站 SPI 用于 Delete 确认
+			if s.ChildSAOut != nil && s.ChildSAIn != nil && s.ChildSAIn.SPI == spi {
+				deletedLocalSPIs = append(deletedLocalSPIs, s.ChildSAOut.SPI)
+			}
 			if s.ChildSAsIn != nil {
 				delete(s.ChildSAsIn, spi)
 			}
@@ -249,6 +258,23 @@ func (s *Session) handleIncomingInformational(data []byte) error {
 					s.childOutPolicies[0].saOut = nil
 				}
 			}
+		}
+
+		// 回复 Delete 确认（包含本端出站 SPI）
+		if len(deletedLocalSPIs) > 0 {
+			raw := make([]byte, 0, 4*len(deletedLocalSPIs))
+			for _, localSPI := range deletedLocalSPIs {
+				b := make([]byte, 4)
+				binary.BigEndian.PutUint32(b, localSPI)
+				raw = append(raw, b...)
+			}
+			delResp := &ikev2.EncryptedPayloadDelete{
+				ProtocolID: ikev2.ProtoESP,
+				SPISize:    4,
+				NumSPIs:    uint16(len(deletedLocalSPIs)),
+				SPIs:       raw,
+			}
+			return s.sendEncryptedResponseWithMsgID([]ikev2.Payload{delResp}, ikev2.INFORMATIONAL, msgID)
 		}
 	}
 

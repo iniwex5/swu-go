@@ -64,6 +64,10 @@ type Session struct {
 
 	natKeepaliveStarted bool
 
+	// strongSwan 风格时间戳——用于自适应 keepalive / DPD 按需检测
+	lastInboundTime  time.Time // 最后收到入站 IKE/ESP 包的时间
+	lastOutboundTime time.Time // 最后发出出站 IKE/keepalive 包的时间
+
 	cpConfig *ikev2.CPConfig
 	tsi      []*ikev2.TrafficSelector
 	tsr      []*ikev2.TrafficSelector
@@ -572,7 +576,14 @@ func (s *Session) logSessionStats(interval time.Duration) {
 	}
 }
 
+// startNATKeepalive 启动 NAT keepalive（对齐 strongSwan ike_sa.c:send_keepalive）
+// 逻辑：
+//  1. 基于出站时间差 (lastOutboundTime) 动态计算下次发送时间
+//  2. 超出 interval + dpdMargin 则升级为 DPD 请求
+//  3. 正常范围内发送 0xFF 单字节 keepalive
 func (s *Session) startNATKeepalive(interval time.Duration) {
+	const keepaliveDPDMargin = 150 * time.Second // strongSwan keep_alive_dpd_margin 默认值
+
 	if s.natKeepaliveStarted || interval <= 0 {
 		return
 	}
@@ -583,17 +594,45 @@ func (s *Session) startNATKeepalive(interval time.Duration) {
 		return
 	}
 
+	// 初始化出站时间戳
+	if s.lastOutboundTime.IsZero() {
+		s.lastOutboundTime = time.Now()
+	}
+
 	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
 		for {
+			diff := time.Since(s.lastOutboundTime)
+
+			if keepaliveDPDMargin > 0 && diff > interval+keepaliveDPDMargin {
+				// strongSwan: 超出 keepalive + dpd_margin → 改发 DPD（而非 keepalive）
+				s.Logger.Debug("NAT keepalive 超时过久，改发 DPD",
+					logger.Duration("diff", diff))
+				go func() {
+					if err := s.sendDPD(); err != nil {
+						s.Logger.Warn("DPD 请求失败（由 keepalive 升级触发）", logger.Err(err))
+					}
+				}()
+				diff = 0
+			} else if diff >= interval {
+				// 正常 keepalive
+				if err := sender.SendNATKeepalive(); err != nil {
+					s.Logger.Debug("NAT keepalive 发送失败", logger.Err(err))
+				} else {
+					s.lastOutboundTime = time.Now()
+				}
+				diff = 0
+			}
+
+			// 自适应调度：下次唤醒 = interval - diff
+			wait := interval - diff
+			if wait <= 0 {
+				wait = interval
+			}
+
 			select {
 			case <-s.ctx.Done():
 				return
-			case <-ticker.C:
-				if err := sender.SendNATKeepalive(); err != nil {
-					s.Logger.Debug("NAT keepalive 发送失败", logger.Err(err))
-				}
+			case <-time.After(wait):
 			}
 		}
 	}()
@@ -1769,8 +1808,17 @@ func (s *Session) sendEncryptedWithRetry(payloads []ikev2.Payload, exchangeType 
 		logger.Int("exchange", int(exchangeType)),
 	)
 
+	// 更新出站时间戳（与 strongSwan stats[STAT_OUTBOUND] 一致）
+	s.lastOutboundTime = time.Now()
+
 	return s.retryCtx.SendWithRetry(
-		s.socket.SendIKE,
+		func(data []byte) error {
+			err := s.socket.SendIKE(data)
+			if err == nil {
+				s.lastOutboundTime = time.Now()
+			}
+			return err
+		},
 		func(timeout time.Duration) ([]byte, error) {
 			return s.receiveIKEResponseWithTimeout(exchangeType, msgID, timeout)
 		},

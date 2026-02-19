@@ -56,44 +56,50 @@ func (s *Session) sendDeleteChildSA(spis []uint32) error {
 	return s.socket.SendIKE(pkt)
 }
 
-// StartDPD 启动 DPD 后台任务
-// 连续 dpdMaxFail 次失败触发 session down
+// StartDPD 启动 DPD 后台任务（对齐 strongSwan ike_sa.c:send_dpd）
+// strongSwan 策略：
+//  1. 检查 lastInboundTime（入站时间差），有流量则跳过 DPD 请求
+//  2. DPD 发送由 sendEncryptedWithRetry 负责超时重传（5次/~165s）
+//  3. 重传耗尽 → 判定对端不可达，触发隧道重建
 func (s *Session) StartDPD(interval time.Duration) {
-	const dpdMaxFail = 3
+	// 初始化入站时间戳
+	if s.lastInboundTime.IsZero() {
+		s.lastInboundTime = time.Now()
+	}
 
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-
-		failCount := 0
 
 		for {
 			select {
 			case <-s.ctx.Done():
 				return
 			case <-ticker.C:
-				if err := s.sendDPD(); err != nil {
-					failCount++
-					s.Logger.Warn("DPD 发送失败",
-						logger.Err(err),
-						logger.Int("连续失败", failCount))
-
-					if failCount >= dpdMaxFail {
-						s.Logger.Error("DPD 连续失败达上限，判定对端不可达",
-							logger.Int("maxFail", dpdMaxFail))
-						if s.OnSessionDown != nil {
-							go s.OnSessionDown()
-						} else if s.cancel != nil {
-							s.cancel()
-						}
-						return
-					}
-				} else {
-					if failCount > 0 {
-						s.Logger.Info("DPD 恢复正常", logger.Int("之前连续失败", failCount))
-					}
-					failCount = 0
+				// strongSwan 策略：检查入站时间差，有流量则跳过 DPD
+				diff := time.Since(s.lastInboundTime)
+				if diff < interval {
+					// 入站间隔内有流量，对端存活，无需 DPD
+					continue
 				}
+
+				// 超过 DPD 间隔无入站流量，发送 DPD 探测
+				s.Logger.Debug("发送 DPD 请求",
+					logger.Duration("lastInbound", diff))
+				if err := s.sendDPD(); err != nil {
+					// sendDPD → sendEncryptedWithRetry 已经做了 5 次指数退避重传
+					// 到达这里说明 ~165s 内全部超时，判定对端不可达
+					s.Logger.Error("DPD 重传耗尽，判定对端不可达",
+						logger.Err(err))
+					if s.OnSessionDown != nil {
+						go s.OnSessionDown()
+					} else if s.cancel != nil {
+						s.cancel()
+					}
+					return
+				}
+				// DPD 成功 → 更新入站时间戳
+				s.lastInboundTime = time.Now()
 			}
 		}
 	}()
