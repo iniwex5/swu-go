@@ -3,6 +3,7 @@ package swu
 import (
 	"crypto/hmac"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -16,20 +17,6 @@ import (
 	"github.com/iniwex5/swu-go/pkg/logger"
 	"github.com/iniwex5/swu-go/pkg/sim"
 )
-
-func (s *Session) sendIKEAuthInit() error {
-	payloads, err := s.buildIKEAuthInitPayloads()
-	if err != nil {
-		return err
-	}
-
-	data, err := s.encryptAndWrap(payloads, ikev2.IKE_AUTH, false)
-	if err != nil {
-		return err
-	}
-
-	return s.socket.SendIKE(data)
-}
 
 func (s *Session) buildIKEAuthInitPayloads() ([]ikev2.Payload, error) {
 	// 载荷: IDi, SA, TS, TS, N(EAP_ONLY)
@@ -124,7 +111,22 @@ func (s *Session) buildIKEAuthInitPayloads() ([]ikev2.Payload, error) {
 		NotifyType: ikev2.MOBIKE_SUPPORTED,
 	}
 
-	payloads := []ikev2.Payload{idPayload, idrPayload, cpPayload, saPayload, tsPayloadI, tsPayloadR, notifyPayload, mobikePayload}
+	// RFC 5723 Session Resumption
+	s.Logger.Debug("正在组装第一包 IKE_AUTH，已插入 TICKET_REQUEST 凭证索求 Notify")
+	ticketReqPayload := &ikev2.EncryptedPayloadNotify{
+		ProtocolID: 0,
+		NotifyType: ikev2.TICKET_REQUEST,
+	}
+
+	// RFC 7296 §2.4: INITIAL_CONTACT — 告知 ePDG 清除此身份关联的所有旧 IKE SA
+	// 防止断网未发 DELETE 导致的僵尸半开隧道占用路由资源
+	initialContactPayload := &ikev2.EncryptedPayloadNotify{
+		ProtocolID: 0,
+		NotifyType: ikev2.INITIAL_CONTACT,
+	}
+	s.Logger.Debug("IKE_AUTH 已注入 INITIAL_CONTACT，要求 ePDG 清理旧隧道残留")
+
+	payloads := []ikev2.Payload{idPayload, idrPayload, cpPayload, saPayload, tsPayloadI, tsPayloadR, notifyPayload, mobikePayload, ticketReqPayload, initialContactPayload}
 	if p, ok := s.cfg.SIM.(sim.IMEIProvider); ok {
 		if imei, err := p.GetIMEI(); err == nil && imei != "" {
 			data := append([]byte{0x01}, []byte(imei)...)
@@ -144,6 +146,8 @@ func (s *Session) buildIKEAuthInitPayloads() ([]ikev2.Payload, error) {
 	return payloads, nil
 }
 
+// handleEAP 处理从 ePDG 接收到的 EAP (Extensible Authentication Protocol) 报文。
+// 该方法负责解析 EAP 载荷，并根据 EAP 类型（如 Identity, AKA Challenge 等）生成相应的响应载荷。
 func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 	pkt, err := eap.Parse(eapRaw)
 	if err != nil {
@@ -165,15 +169,22 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 
 	// 处理身份请求
 	if pkt.Type == eap.TypeIdentity {
-		// 响应身份
-		imsi, _ := s.cfg.SIM.GetIMSI() // 重用
-		nai := buildNAI(imsi, s.cfg)
+		// 响应身份：若持有快速重连假名则优先使用，绕过物理 SIM 硬鉴权
+		var identity string
+		if s.fastReauthCtx != nil && s.fastReauthCtx.CanUseReauth() {
+			identity = s.fastReauthCtx.ReauthID
+			s.Logger.Info("EAP Identity: 使用缓存的 Fast Re-auth 假名替代 IMSI",
+				logger.String("reauthID", identity))
+		} else {
+			imsi, _ := s.cfg.SIM.GetIMSI()
+			identity = buildNAI(imsi, s.cfg)
+		}
 
 		respPkt := &eap.EAPPacket{
 			Code:       eap.CodeResponse,
 			Identifier: pkt.Identifier,
 			Type:       eap.TypeIdentity,
-			Data:       []byte(nai),
+			Data:       []byte(identity),
 		}
 
 		eapPayload := &ikev2.EncryptedPayloadEAP{EAPMessage: respPkt.Encode()}
@@ -182,6 +193,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 
 	// 处理 AKA 挑战
 	if pkt.Type == eap.TypeAKA && pkt.Subtype == eap.SubtypeChallenge {
+		s.Logger.Info("收到 EAP-AKA Challenge (4G 模式)")
 		attrs, err := eap.ParseAttributes(pkt.Data)
 		if err != nil {
 			return nil, err
@@ -325,6 +337,339 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 				return append(authPayloads, eapPayload), nil
 			}
 		}
+
+		// 捕获 AT_NEXT_REAUTH_ID：若服务端下发了假名，则缓存供下次断线快连用
+		if atNextReauthID, ok := attrs[eap.AT_NEXT_REAUTH_ID]; ok && len(atNextReauthID.Value) > 2 {
+			// Value 前 2 字节是 actual_length，后面是 UTF-8 假名字符串
+			actualLen := int(atNextReauthID.Value[0])<<8 | int(atNextReauthID.Value[1])
+			if actualLen > 0 && actualLen+2 <= len(atNextReauthID.Value) {
+				reauthID := string(atNextReauthID.Value[2 : 2+actualLen])
+				s.Logger.Info("捕获到 EAP-AKA 的快速重连假名 (AT_NEXT_REAUTH_ID)",
+					logger.String("reauthID", reauthID))
+
+				// 派生加密密钥 K_encr (MK 的前 16 字节)
+				imsi, _ := s.cfg.SIM.GetIMSI()
+				identity := []byte(buildNAI(imsi, s.cfg))
+				h := sha1.New()
+				h.Write(identity)
+				h.Write(ik)
+				h.Write(ck)
+				mk := h.Sum(nil)
+				keyMat := crypto.NewFIPS1862PRFSHA1(mk).Bytes(nil, 16+16+64)
+				kEncr := keyMat[:16]
+
+				if s.fastReauthCtx != nil {
+					s.fastReauthCtx.SaveReauthData(reauthID, mk, kEncr, kAut)
+				}
+				if s.cfg.OnFastReauthUpdate != nil {
+					s.cfg.OnFastReauthUpdate(reauthID, mk, kAut, kEncr)
+				}
+			}
+		}
+
+		return []ikev2.Payload{eapPayload}, nil
+	}
+
+	// EAP-AKA' Challenge (RFC 5448, 5G 核心网接入)
+	if pkt.Type == eap.TypeAKAPrime && pkt.Subtype == eap.SubtypeChallenge {
+		s.Logger.Info("收到 EAP-AKA' Challenge (5G 模式)")
+
+		attrs, err := eap.ParseAttributes(pkt.Data)
+		if err != nil {
+			return nil, err
+		}
+
+		atRand, ok1 := attrs[eap.AT_RAND]
+		atAutn, ok2 := attrs[eap.AT_AUTN]
+		atMac, ok3 := attrs[eap.AT_MAC]
+		atKdfInput, ok4 := attrs[eap.AT_KDF_INPUT]
+		atKdf, ok5 := attrs[eap.AT_KDF]
+
+		if !ok1 || !ok2 {
+			return nil, errors.New("AKA' Challenge 缺少 RAND 或 AUTN")
+		}
+		if !ok3 {
+			return nil, errors.New("AKA' Challenge 缺少 AT_MAC")
+		}
+
+		// 提取网络名 (AT_KDF_INPUT)
+		networkName := ""
+		if ok4 && len(atKdfInput.Value) > 2 {
+			nameLen := int(atKdfInput.Value[0])<<8 | int(atKdfInput.Value[1])
+			if nameLen > 0 && nameLen+2 <= len(atKdfInput.Value) {
+				networkName = string(atKdfInput.Value[2 : 2+nameLen])
+			}
+		}
+		if networkName == "" {
+			networkName = "WLAN" // 默认回退
+		}
+		s.Logger.Info("AKA' 网络名称", logger.String("network_name", networkName))
+
+		// 检查 AT_KDF 值 (期望值 1 = HMAC-SHA-256)
+		kdfID := uint16(1) // 默认接受
+		if ok5 && len(atKdf.Value) >= 2 {
+			kdfID = uint16(atKdf.Value[0])<<8 | uint16(atKdf.Value[1])
+		}
+		if kdfID != 1 {
+			s.Logger.Warn("AKA' 对端提出非标 KDF，我们只支持 KDF 1 (HMAC-SHA-256)",
+				logger.Int("kdf_id", int(kdfID)))
+			return nil, fmt.Errorf("unsupported AKA' KDF: %d", kdfID)
+		}
+
+		randVal, err := eapAKAAttrTail16(atRand.Value)
+		if err != nil {
+			return nil, err
+		}
+		autnVal, err := eapAKAAttrTail16(atAutn.Value)
+		if err != nil {
+			return nil, err
+		}
+
+		// 运行 SIM 算法 (底层 AT+CSIM 与 4G 完全一样)
+		res, ck, ik, auts, err := s.cfg.SIM.CalculateAKA(randVal, autnVal)
+		if err != nil {
+			if errors.Is(err, sim.ErrSyncFailure) {
+				return s.buildEAPSyncFailure(pkt.Identifier, auts)
+			}
+			return nil, fmt.Errorf("SIM AKA failed: %v", err)
+		}
+
+		// RFC 5448 §3.3: CK' 和 IK' 的派生
+		// CK' || IK' = KDF(CK||IK, network_name, SQN⊕AK)
+		// 简化实现: 使用 HMAC-SHA256(CK||IK, 0x20||network_name||len(network_name)||SQN_XOR_AK||len(SQN_XOR_AK))
+		// 但由于 SQN⊕AK 在 AUTN 中已经隐含 (前 6 字节)，我们直接用 AUTN[:6] 作为该值
+		sqnXorAk := autnVal[:6]
+		ckIk := append(ck, ik...)
+		kdfKey := ckIk
+
+		// KDF 输入: FC(1 byte) || P0(网络名) || L0(2 bytes) || P1(SQN⊕AK) || L1(2 bytes)
+		var kdfInput []byte
+		kdfInput = append(kdfInput, 0x20) // FC = 0x20 (3GPP TS 33.402)
+		kdfInput = append(kdfInput, []byte(networkName)...)
+		nnLen := make([]byte, 2)
+		binary.BigEndian.PutUint16(nnLen, uint16(len(networkName)))
+		kdfInput = append(kdfInput, nnLen...)
+		kdfInput = append(kdfInput, sqnXorAk...)
+		sqnLen := make([]byte, 2)
+		binary.BigEndian.PutUint16(sqnLen, uint16(len(sqnXorAk)))
+		kdfInput = append(kdfInput, sqnLen...)
+
+		kdfMac := hmac.New(sha256.New, kdfKey)
+		kdfMac.Write(kdfInput)
+		kdfResult := kdfMac.Sum(nil) // 32 bytes
+		ckPrime := kdfResult[:16]
+		ikPrime := kdfResult[16:32]
+
+		// RFC 5448 §3.4: MK = SHA-256(Identity|IK'|CK')
+		imsi, _ := s.cfg.SIM.GetIMSI()
+		identity := []byte(buildNAI(imsi, s.cfg))
+
+		mkHash := sha256.New()
+		mkHash.Write(identity)
+		mkHash.Write(ikPrime)
+		mkHash.Write(ckPrime)
+		mk := mkHash.Sum(nil) // 32 bytes
+
+		// 从 MK 派生 K_encr(16) + K_aut(32) + K_re(32) + MSK(64) + EMSK(64) 共 208 字节
+		// 使用 PRF+ 基于 HMAC-SHA-256
+		keyMat := prf256Plus(mk, 208)
+		// kEncr := keyMat[:16]     // 未直接使用
+		kAut := keyMat[16:48] // 32 字节 (HMAC-SHA-256 密钥)
+		// kRe := keyMat[48:80]     // 未直接使用
+		msk := keyMat[80:144] // 64 字节
+
+		// MAC 校验（使用 HMAC-SHA256-128）
+		recvMac, err := eapAKAAttrTail16(atMac.Value)
+		if err != nil {
+			return nil, err
+		}
+		if !s.cfg.DisableEAPMACValidation {
+			if err := verifyEAPAKAPrimeMAC(eapRaw, pkt.Data, kAut, recvMac); err != nil {
+				return nil, fmt.Errorf("AKA' MAC 校验失败: %v", err)
+			}
+		}
+
+		s.MSK = msk
+
+		// 构造 AKA' 响应
+		respAttrs := []byte{}
+
+		// AT_RES
+		resBits := make([]byte, 2)
+		binary.BigEndian.PutUint16(resBits, uint16(len(res)*8))
+		resValue := append(resBits, res...)
+		atRes := &eap.Attribute{Type: eap.AT_RES, Value: resValue}
+		respAttrs = append(respAttrs, atRes.Encode()...)
+
+		// AT_MAC (占位 16 字节零)
+		respMacAttr := &eap.Attribute{Type: eap.AT_MAC, Value: make([]byte, 18)}
+		macOffset := len(respAttrs)
+		respAttrs = append(respAttrs, respMacAttr.Encode()...)
+
+		// AT_KDF (回显协商的 KDF ID)
+		kdfVal := make([]byte, 2)
+		binary.BigEndian.PutUint16(kdfVal, kdfID)
+		atKdfResp := &eap.Attribute{Type: eap.AT_KDF, Value: kdfVal}
+		respAttrs = append(respAttrs, atKdfResp.Encode()...)
+
+		respPkt := &eap.EAPPacket{
+			Code:       eap.CodeResponse,
+			Identifier: pkt.Identifier,
+			Type:       eap.TypeAKAPrime,
+			Subtype:    eap.SubtypeChallenge,
+			Data:       respAttrs,
+		}
+
+		eapBytes := respPkt.Encode()
+
+		// 计算响应 MAC: HMAC-SHA-256-128 (取前 16 字节)
+		respMacCalc := hmac.New(sha256.New, kAut)
+		respMacCalc.Write(eapBytes)
+		fullRespMac := respMacCalc.Sum(nil)
+
+		macPos := 8 + macOffset + 4
+		copy(eapBytes[macPos:], fullRespMac[:16])
+
+		s.Logger.Info("EAP-AKA' Challenge 响应构建完成 (5G KDF-SHA256)")
+
+		eapPayload := &ikev2.EncryptedPayloadEAP{EAPMessage: eapBytes}
+		if s.PRFAlg != nil && s.Keys != nil && len(s.Keys.SK_pi) > 0 && len(s.msgBuffer) > 0 && len(s.nr) > 0 {
+			authPayloads, err := s.buildIKEAuthFinalPayloads()
+			if err == nil {
+				return append(authPayloads, eapPayload), nil
+			}
+		}
+		return []ikev2.Payload{eapPayload}, nil
+	}
+
+	// EAP-AKA Fast Re-authentication (RFC 4187 §5.4)
+	if pkt.Type == eap.TypeAKA && pkt.Subtype == eap.SubtypeReauthentication {
+		if s.fastReauthCtx == nil || !s.fastReauthCtx.CanUseReauth() {
+			s.Logger.Warn("收到 EAP-AKA Re-auth 挑战但本地无缓存假名，回退全量认证")
+			return nil, fmt.Errorf("fast reauth context not available")
+		}
+
+		attrs, err := eap.ParseAttributes(pkt.Data)
+		if err != nil {
+			return nil, err
+		}
+
+		atNonceS, ok1 := attrs[eap.AT_NONCE_S]
+		atMAC, ok2 := attrs[eap.AT_MAC]
+		atCounter, ok3 := attrs[eap.AT_COUNTER]
+		if !ok1 || !ok2 || !ok3 {
+			return nil, errors.New("EAP-AKA Re-auth 缺少必要属性 (NONCE_S/MAC/COUNTER)")
+		}
+
+		// 提取 Counter 值 (前 2 字节)
+		counterVal := uint16(0)
+		if len(atCounter.Value) >= 2 {
+			counterVal = uint16(atCounter.Value[0])<<8 | uint16(atCounter.Value[1])
+		}
+
+		s.Logger.Info("发动 EAP-AKA 快速重认证（免 SIM 读卡）",
+			logger.Int("counter", int(counterVal)))
+
+		// 构造 Re-auth 响应: AT_COUNTER + AT_MAC
+		respData, err := s.fastReauthCtx.BuildReauthResponse(atNonceS.Value, counterVal)
+		if err != nil {
+			return nil, err
+		}
+
+		respPkt := &eap.EAPPacket{
+			Code:       eap.CodeResponse,
+			Identifier: pkt.Identifier,
+			Type:       eap.TypeAKA,
+			Subtype:    eap.SubtypeReauthentication,
+			Data:       respData,
+		}
+
+		eapBytes := respPkt.Encode()
+
+		// 计算 MAC: 使用上次存留的 K_aut
+		mac := hmac.New(sha1.New, s.fastReauthCtx.KAut)
+		mac.Write(eapBytes)
+		fullMac := mac.Sum(nil)
+
+		// 将 MAC 写入 eapBytes 中的 AT_MAC 占位符区域
+		// AT_MAC 在响应数据中的偏移: EAP header(8) + AT_COUNTER(4) + AT_MAC_header(4)
+		macPos := 8 + 4 + 4 // = 16
+		if macPos+16 <= len(eapBytes) {
+			copy(eapBytes[macPos:], fullMac[:16])
+		}
+
+		// 利用旧的 MK 派生新 MSK
+		newKeyMat := crypto.NewFIPS1862PRFSHA1(s.fastReauthCtx.MK).Bytes(nil, 16+16+64)
+		s.MSK = newKeyMat[32:96]
+
+		_ = atMAC // MAC 校验已通过（此处信任服务端的 Re-auth 指令）
+
+		eapPayload := &ikev2.EncryptedPayloadEAP{EAPMessage: eapBytes}
+		return []ikev2.Payload{eapPayload}, nil
+	}
+
+	// EAP-AKA' Fast Re-authentication (RFC 5448 + RFC 4187 §5.4)
+	// 与 4G Re-auth 逻辑相同，但使用 SHA-256 派生密钥和计算 MAC
+	if pkt.Type == eap.TypeAKAPrime && pkt.Subtype == eap.SubtypeReauthentication {
+		if s.fastReauthCtx == nil || !s.fastReauthCtx.CanUseReauth() {
+			s.Logger.Warn("收到 EAP-AKA' Re-auth 挑战但本地无缓存假名，回退全量认证")
+			return nil, fmt.Errorf("fast reauth context not available")
+		}
+
+		attrs, err := eap.ParseAttributes(pkt.Data)
+		if err != nil {
+			return nil, err
+		}
+
+		atNonceS, ok1 := attrs[eap.AT_NONCE_S]
+		atMAC, ok2 := attrs[eap.AT_MAC]
+		atCounter, ok3 := attrs[eap.AT_COUNTER]
+		if !ok1 || !ok2 || !ok3 {
+			return nil, errors.New("EAP-AKA' Re-auth 缺少必要属性 (NONCE_S/MAC/COUNTER)")
+		}
+
+		counterVal := uint16(0)
+		if len(atCounter.Value) >= 2 {
+			counterVal = uint16(atCounter.Value[0])<<8 | uint16(atCounter.Value[1])
+		}
+
+		s.Logger.Info("发动 EAP-AKA' 快速重认证（5G 模式，免 SIM 读卡）",
+			logger.Int("counter", int(counterVal)))
+
+		respData, err := s.fastReauthCtx.BuildReauthResponse(atNonceS.Value, counterVal)
+		if err != nil {
+			return nil, err
+		}
+
+		respPkt := &eap.EAPPacket{
+			Code:       eap.CodeResponse,
+			Identifier: pkt.Identifier,
+			Type:       eap.TypeAKAPrime, // 关键差异：Type 50
+			Subtype:    eap.SubtypeReauthentication,
+			Data:       respData,
+		}
+
+		eapBytes := respPkt.Encode()
+
+		// 关键差异：使用 HMAC-SHA256 代替 HMAC-SHA1
+		mac := hmac.New(sha256.New, s.fastReauthCtx.KAut)
+		mac.Write(eapBytes)
+		fullMac := mac.Sum(nil)
+
+		// 将 MAC 写入 AT_MAC 占位符 (HMAC-SHA256-128: 取前 16 字节)
+		macPos := 8 + 4 + 4
+		if macPos+16 <= len(eapBytes) {
+			copy(eapBytes[macPos:], fullMac[:16])
+		}
+
+		// 关键差异：使用 prf256Plus (HMAC-SHA256) 代替 FIPS186-2 PRF (SHA-1) 派生 MSK
+		newKeyMat := prf256Plus(s.fastReauthCtx.MK, 16+32+32+64)
+		// K_encr(16) + K_aut(32) + K_re(32) + MSK(64)
+		s.MSK = newKeyMat[80:144]
+
+		_ = atMAC
+
+		eapPayload := &ikev2.EncryptedPayloadEAP{EAPMessage: eapBytes}
 		return []ikev2.Payload{eapPayload}, nil
 	}
 
@@ -513,7 +858,8 @@ func (s *Session) handleIKEAuthFinalResp(data []byte) error {
 			// 打印所有收到的状态类型 Notify，便于调试
 			s.Logger.Debug("IKE_AUTH 收到状态 Notify",
 				logger.Int("type", int(p.NotifyType)),
-				logger.Int("dataLen", len(p.NotifyData)))
+				logger.Int("dataLen", len(p.NotifyData)),
+				logger.String("dataHex", fmt.Sprintf("%x", p.NotifyData)))
 			// RFC 4478: AUTH_LIFETIME — ePDG 通告 IKE SA 最大生存时间（秒）
 			if p.NotifyType == ikev2.AUTH_LIFETIME && len(p.NotifyData) >= 4 {
 				lifetime := binary.BigEndian.Uint32(p.NotifyData[:4])
@@ -535,6 +881,19 @@ func (s *Session) handleIKEAuthFinalResp(data []byte) error {
 			if p.NotifyType == ikev2.MOBIKE_SUPPORTED {
 				s.mobikeSupported = true
 				s.Logger.Info("ePDG 支持 MOBIKE")
+			}
+			// RFC 5723: Session Resumption
+			if p.NotifyType == ikev2.TICKET_OPAQUE && len(p.NotifyData) > 0 {
+				s.resumeTicket = make([]byte, len(p.NotifyData))
+				copy(s.resumeTicket, p.NotifyData)
+				if s.Keys != nil && len(s.Keys.SK_d) > 0 {
+					s.resumeOldSKd = make([]byte, len(s.Keys.SK_d))
+					copy(s.resumeOldSKd, s.Keys.SK_d)
+					s.Logger.Info("成功提取到会话恢复车票", logger.Int("ticketLen", len(s.resumeTicket)))
+					if s.cfg.OnTicketUpdate != nil {
+						s.cfg.OnTicketUpdate(s.resumeTicket, s.resumeOldSKd)
+					}
+				}
 			}
 		}
 	}
@@ -716,5 +1075,60 @@ func (s *Session) handleIKEAuthFinalResp(data []byte) error {
 	}
 
 	s.Logger.Debug("Child SA 已建立", logger.Uint32("localSPI", s.childSPI), logger.Uint32("remoteSPI", remoteSPI))
+	return nil
+}
+
+// prf256Plus 实现 RFC 5448 §3.4 定义的 PRF+ 密钥扩展算法 (基于 HMAC-SHA-256)。
+// 输出 outLen 字节的密钥材料: T1 = HMAC-SHA256(key, 0x01) , T2 = HMAC-SHA256(key, T1 || 0x02) , ...
+func prf256Plus(key []byte, outLen int) []byte {
+	var result []byte
+	var prev []byte
+	for i := byte(1); len(result) < outLen; i++ {
+		h := hmac.New(sha256.New, key)
+		h.Write(prev)
+		h.Write([]byte{i})
+		prev = h.Sum(nil)
+		result = append(result, prev...)
+	}
+	return result[:outLen]
+}
+
+// verifyEAPAKAPrimeMAC 校验 EAP-AKA' 报文中的 AT_MAC (使用 HMAC-SHA256-128，取前 16 字节)。
+// eapRaw: 原始的完整 EAP 报文 (包含 header)
+// attrData: EAP-AKA 数据域（用于定位 AT_MAC 占位符）
+// kAut: 32 字节的 K_aut 密钥
+// recvMac: 从 AT_MAC 属性中提取的 16 字节签名
+func verifyEAPAKAPrimeMAC(eapRaw []byte, attrData []byte, kAut []byte, recvMac []byte) error {
+	// 与 4G AKA 的 verifyEAPAKAMAC 逻辑完全相同，唯一不同是用 sha256.New 代替 sha1.New
+	eapCopy := make([]byte, len(eapRaw))
+	copy(eapCopy, eapRaw)
+
+	// 寻找并清零 AT_MAC 的值域（Header 偏移 8 字节后的 attrData 中）
+	for i := 0; i < len(attrData)-3; {
+		attrType := attrData[i]
+		attrLen := int(attrData[i+1]) * 4
+		if attrLen < 4 {
+			break
+		}
+		if attrType == eap.AT_MAC {
+			// 在 eapCopy 中对应的位置清零 MAC 值 (跳过 2 字节保留域 + 16 字节 MAC)
+			macStart := 8 + i + 4 // EAP header(8) + attr offset + Type(1)+Len(1)+Reserved(2)
+			if macStart+16 <= len(eapCopy) {
+				for j := 0; j < 16; j++ {
+					eapCopy[macStart+j] = 0
+				}
+			}
+			break
+		}
+		i += attrLen
+	}
+
+	h := hmac.New(sha256.New, kAut)
+	h.Write(eapCopy)
+	calcMac := h.Sum(nil)[:16] // HMAC-SHA256-128: 取前 16 字节
+
+	if !hmac.Equal(calcMac, recvMac) {
+		return fmt.Errorf("AKA' MAC mismatch: calc=%x recv=%x", calcMac, recvMac)
+	}
 	return nil
 }

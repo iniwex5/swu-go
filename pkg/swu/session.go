@@ -16,6 +16,7 @@ import (
 	"github.com/iniwex5/netlink/nl"
 	"github.com/iniwex5/swu-go/pkg/crypto"
 	"github.com/iniwex5/swu-go/pkg/driver"
+	"github.com/iniwex5/swu-go/pkg/eap"
 	"github.com/iniwex5/swu-go/pkg/ikev2"
 	"github.com/iniwex5/swu-go/pkg/ipsec"
 	"github.com/iniwex5/swu-go/pkg/logger"
@@ -24,9 +25,10 @@ import (
 
 // SA 生命周期常量（秒）
 const (
-	ikeRekeyInterval   = 360 // 6 分钟：主动 IKE SA Rekey
-	childRekeyInterval = 420 // 7 分钟：主动 Child SA Rekey（在 ePDG ~8 分钟 ESP SA 过期前）
-	childRekeyJitter   = 30  // 最大 30 秒随机 jitter，避免多设备同时 Rekey
+	ikeRekeyInterval   = 1500 // 6 分钟：主动 IKE SA Rekey
+	childRekeyInterval = 1800 // 7 分钟：主动 Child SA Rekey（在 ePDG ~8 分钟 ESP SA 过期前）
+	ikeRekeyJitter     = 30   // 最大 30 秒随机 jitter，避免多设备同时 IKE Rekey (对标 strongSwan margintime)
+	childRekeyJitter   = 30   // 最大 30 秒随机 jitter，避免多设备同时 Child SA Rekey
 )
 
 type Session struct {
@@ -124,6 +126,13 @@ type Session struct {
 	cookie     []byte // ePDG 返回的 COOKIE
 	sendCookie bool   // 标记是否需要发送 COOKIE
 
+	// RFC 5723: Session Resumption
+	resumeTicket []byte // ePDG 下发的 Ticket_Opaque
+	resumeOldSKd []byte // 存放被销毁前一任 IKE_SA 的引流密钥 SK_d
+
+	// RFC 4187: EAP-AKA Fast Re-authentication
+	fastReauthCtx *eap.FastReauthContext // 快速重连上下文(假名+密钥缓存)
+
 	mobikeSupported        bool            // 对端是否支持 MOBIKE (RFC 4555)
 	fragmentationSupported bool            // 对端是否支持 IKE Fragmentation (RFC 7383)
 	ikeFragmentMTU         uint32          // 动态探测的当前 IKE 最大分片大小
@@ -190,8 +199,20 @@ func NewSession(cfg *Config, l *zap.Logger) *Session {
 		done:             make(chan struct{}),
 		reauthTrigger:    make(chan struct{}, 1),
 		fragmentBuf:      newFragmentBuffer(),
-		ikeFragmentMTU:   1280, // Default MTU
+		ikeFragmentMTU:   1280,             // Default MTU
+		resumeTicket:     cfg.ResumeTicket, // 从外级上下文挂载可能传下来的“前世”车票
+		resumeOldSKd:     cfg.ResumeOldSKd,
+		fastReauthCtx:    initFastReauthCtx(cfg),
 	}
+}
+
+// initFastReauthCtx 从外层 Config 恢复快速重认证上下文
+func initFastReauthCtx(cfg *Config) *eap.FastReauthContext {
+	ctx := eap.NewFastReauthContext()
+	if cfg.FastReauthID != "" && len(cfg.FastReauthMK) > 0 {
+		ctx.SaveReauthData(cfg.FastReauthID, cfg.FastReauthMK, cfg.FastReauthKEncr, cfg.FastReauthKAut)
+	}
+	return ctx
 }
 
 // Connect 连接到 ePDG，支持 REDIRECT 重连和 Reauthentication
@@ -288,147 +309,170 @@ func (s *Session) connectOnce() error {
 
 	go s.logSessionStats(60 * time.Second)
 
-	// 2. IKE_SA_INIT
-	for {
-		reqData, err := s.buildIKESAInitPacket()
-		if err != nil {
-			return err
-		}
-
-		// 异步推送，并挂起等待窗口的回执通道
-		compCh := s.taskMgr.EnqueueRequest(0, ikev2.IKE_SA_INIT, nil, reqData)
-
-		var respData []byte
-		var ok bool
-		select {
-		case <-s.ctx.Done():
-			return s.ctx.Err()
-		case respData, ok = <-compCh:
-			if !ok || respData == nil {
-				return ErrWindowTimeout
+	resumed := false
+	// 检查是否有存活的 Ticket，实施 RFC 5723 快速恢复
+	if len(s.resumeTicket) > 0 && len(s.resumeOldSKd) > 0 {
+		s.Logger.Info("察觉到 Ticket 车票缓存，尝试发动 IKEv2 Session Resumption 瞬时重连...")
+		err = s.performSessionResumption()
+		if err == nil {
+			// 恢复成功，Child SA 以及内部配置已双双建立
+			resumed = true
+		} else {
+			s.Logger.Warn("Session Resumption 恢复尝试失败，退化为完整全量握手", logger.Err(err))
+			// 消除失效的车票
+			s.resumeTicket = nil
+			s.resumeOldSKd = nil
+			if s.cfg.OnTicketUpdate != nil {
+				s.cfg.OnTicketUpdate(nil, nil)
 			}
+			// Sequence 可能在过程中被递增了，重置之
+			s.SequenceNumber.Store(0)
 		}
-
-		if err := s.handleIKESAInitResp(respData); err != nil {
-			if errors.Is(err, ErrCookieRequired) {
-				continue
-			}
-			return err
-		}
-		break
 	}
 
-	s.Logger.Debug("IKE_SA_INIT 完成，密钥已生成")
-	s.SequenceNumber.Store(1)
-
-	s.ws, err = NewWiresharkDebugger(s.cfg.EnableWiresharkKeyLog, s.cfg.WiresharkKeyLogPath)
-	if err != nil {
-		return err
-	}
-	if s.ws != nil {
-		defer s.ws.Close()
-		s.ws.LogIKESAKeys(s.SPIi, s.SPIr, s.Keys.SK_ei, s.Keys.SK_er, s.Keys.SK_ai, s.Keys.SK_ar, s.ikeEncrID, s.ikeIntegID)
-	}
-
-	// 3. IKE_AUTH
-	// 警告: IKE_AUTH 通常发送 EAP 请求？或者 EAP 在 IKE_AUTH 响应内部开始？
-	// RFC 7296 1.2:
-	// Init -> SA, KE, Ni, N(NAT_DETECTION_*)
-	// Resp -> SA, KE, Nr, N(NAT_DETECTION_*), [CERTREQ]
-	// Init -> SK { IDi, [CERT+], [CERTREQ+], [IDr], AUTH, SAi2, TSi, TSr }
-	// 等等，对于 EAP-AKA:
-	// Init -> SK { IDi, SAi2, TSi, TSr, N(EAP_ONLY) }  (还没有 AUTH，因为我们要进行 EAP)
-	// Resp -> SK { IDr, AUTH, EAP(Request) }
-
-	payloads, err := s.buildIKEAuthInitPayloads()
-	if err != nil {
-		return err
-	}
-
-	respData, err := s.sendEncryptedWithRetry(payloads, ikev2.IKE_AUTH)
-	if err != nil {
-		return err
-	}
-
-	// EAP 本地循环
-	for {
-		msgID, payloads, err := s.decryptAndParse(respData)
-		if err != nil {
-			return err
-		}
-		_ = msgID // 检查 ID 是否匹配 SequenceNumber？
-
-		// 处理载荷
-		var eapPayload *ikev2.EncryptedPayloadEAP
-		// var authPayload *ikev2.EncryptedPayloadAuth
-
-		for _, p := range payloads {
-			if e, ok := p.(*ikev2.EncryptedPayloadEAP); ok {
-				eapPayload = e
-			}
-			// 检查 AUTH (成功)
-			if _, ok := p.(*ikev2.EncryptedPayloadAuth); ok {
-				// EAP Success 通常随服务器的 AUTH 一起到来
-				s.Logger.Debug("收到 AUTH 载荷")
-			}
-			// 检查 CP (配置)
-			if _, ok := p.(*ikev2.EncryptedPayloadCP); ok {
-				s.Logger.Debug("收到配置载荷")
-				// 解析 IP 和 DNS
-			}
-		}
-
-		if eapPayload != nil {
-			// 处理 EAP
-			respEAP, err := s.handleEAP(eapPayload.EAPMessage)
+	if !resumed {
+		// 2. IKE_SA_INIT
+		for {
+			reqData, err := s.buildIKESAInitPacket()
 			if err != nil {
 				return err
 			}
 
-			// 发送 EAP 响应 (IKE_AUTH 继续)
-			if respEAP == nil {
-				break
-			}
-			respData, err = s.sendEncryptedWithRetry(respEAP, ikev2.IKE_AUTH)
-			if err != nil {
-				return err
-			}
-			continue
-		}
+			// 异步推送，并挂起等待窗口的回执通道
+			compCh := s.taskMgr.EnqueueRequest(0, ikev2.IKE_SA_INIT, nil, reqData)
 
-		if len(s.MSK) == 0 {
-			var types []int
-			var notifies []uint16
-			for _, pl := range payloads {
-				types = append(types, int(pl.Type()))
-				if n, ok := pl.(*ikev2.EncryptedPayloadNotify); ok {
-					notifies = append(notifies, n.NotifyType)
+			var respData []byte
+			var ok bool
+			select {
+			case <-s.ctx.Done():
+				return s.ctx.Err()
+			case respData, ok = <-compCh:
+				if !ok || respData == nil {
+					return ErrWindowTimeout
 				}
 			}
-			if len(notifies) > 0 {
-				return fmt.Errorf("对端未返回 EAP 载荷(payloadTypes=%v notifyTypes=%v)，无法继续 EAP-AKA", types, notifies)
+
+			if err := s.handleIKESAInitResp(respData); err != nil {
+				if errors.Is(err, ErrCookieRequired) {
+					continue
+				}
+				return err
 			}
-			return fmt.Errorf("对端未返回 EAP 载荷(payloadTypes=%v)，无法继续 EAP-AKA", types)
+			break
 		}
 
-		s.Logger.Debug("握手循环完成")
-		break
-	}
+		s.Logger.Debug("IKE_SA_INIT 完成，密钥已生成")
+		s.SequenceNumber.Store(1)
 
-	if err := s.handleIKEAuthFinalResp(respData); err != nil {
-		s.Logger.Debug("EAP 成功响应未完成 CHILD_SA，尝试发送最终 AUTH")
-		finalPayloads, err := s.buildIKEAuthFinalPayloads()
+		s.ws, err = NewWiresharkDebugger(s.cfg.EnableWiresharkKeyLog, s.cfg.WiresharkKeyLogPath)
 		if err != nil {
-			return fmt.Errorf("failed to build final AUTH: %v", err)
-		}
-		respData, err = s.sendEncryptedWithRetry(finalPayloads, ikev2.IKE_AUTH)
-		if err != nil {
-			return fmt.Errorf("failed to send final AUTH: %v", err)
-		}
-		if err := s.handleIKEAuthFinalResp(respData); err != nil {
 			return err
 		}
-	}
+		if s.ws != nil {
+			defer s.ws.Close()
+			s.ws.LogIKESAKeys(s.SPIi, s.SPIr, s.Keys.SK_ei, s.Keys.SK_er, s.Keys.SK_ai, s.Keys.SK_ar, s.ikeEncrID, s.ikeIntegID)
+		}
+
+		// 3. IKE_AUTH
+		// 警告: IKE_AUTH 通常发送 EAP 请求？或者 EAP 在 IKE_AUTH 响应内部开始？
+		// RFC 7296 1.2:
+		// Init -> SA, KE, Ni, N(NAT_DETECTION_*)
+		// Resp -> SA, KE, Nr, N(NAT_DETECTION_*), [CERTREQ]
+		// Init -> SK { IDi, [CERT+], [CERTREQ+], [IDr], AUTH, SAi2, TSi, TSr }
+		// 等等，对于 EAP-AKA:
+		// Init -> SK { IDi, SAi2, TSi, TSr, N(EAP_ONLY) }  (还没有 AUTH，因为我们要进行 EAP)
+		// Resp -> SK { IDr, AUTH, EAP(Request) }
+
+		payloads, err := s.buildIKEAuthInitPayloads()
+		if err != nil {
+			return err
+		}
+
+		respData, err := s.sendEncryptedWithRetry(payloads, ikev2.IKE_AUTH)
+		if err != nil {
+			return err
+		}
+
+		// EAP 本地循环
+		for {
+			msgID, payloads, err := s.decryptAndParse(respData)
+			if err != nil {
+				return err
+			}
+			_ = msgID // 检查 ID 是否匹配 SequenceNumber？
+
+			// 处理载荷
+			var eapPayload *ikev2.EncryptedPayloadEAP
+			// var authPayload *ikev2.EncryptedPayloadAuth
+
+			for _, p := range payloads {
+				if e, ok := p.(*ikev2.EncryptedPayloadEAP); ok {
+					eapPayload = e
+				}
+				// 检查 AUTH (成功)
+				if _, ok := p.(*ikev2.EncryptedPayloadAuth); ok {
+					// EAP Success 通常随服务器的 AUTH 一起到来
+					s.Logger.Debug("收到 AUTH 载荷")
+				}
+				// 检查 CP (配置)
+				if _, ok := p.(*ikev2.EncryptedPayloadCP); ok {
+					s.Logger.Debug("收到配置载荷")
+					// 解析 IP 和 DNS
+				}
+			}
+
+			if eapPayload != nil {
+				// 处理 EAP
+				respEAP, err := s.handleEAP(eapPayload.EAPMessage)
+				if err != nil {
+					return err
+				}
+
+				// 发送 EAP 响应 (IKE_AUTH 继续)
+				if respEAP == nil {
+					break
+				}
+				respData, err = s.sendEncryptedWithRetry(respEAP, ikev2.IKE_AUTH)
+				if err != nil {
+					return err
+				}
+				continue
+			}
+
+			if len(s.MSK) == 0 {
+				var types []int
+				var notifies []uint16
+				for _, pl := range payloads {
+					types = append(types, int(pl.Type()))
+					if n, ok := pl.(*ikev2.EncryptedPayloadNotify); ok {
+						notifies = append(notifies, n.NotifyType)
+					}
+				}
+				if len(notifies) > 0 {
+					return fmt.Errorf("对端未返回 EAP 载荷(payloadTypes=%v notifyTypes=%v)，无法继续 EAP-AKA", types, notifies)
+				}
+				return fmt.Errorf("对端未返回 EAP 载荷(payloadTypes=%v)，无法继续 EAP-AKA", types)
+			}
+
+			s.Logger.Debug("握手循环完成")
+			break
+		}
+
+		if err := s.handleIKEAuthFinalResp(respData); err != nil {
+			s.Logger.Debug("EAP 成功响应未完成 CHILD_SA，尝试发送最终 AUTH")
+			finalPayloads, err := s.buildIKEAuthFinalPayloads()
+			if err != nil {
+				return fmt.Errorf("failed to build final AUTH: %v", err)
+			}
+			respData, err = s.sendEncryptedWithRetry(finalPayloads, ikev2.IKE_AUTH)
+			if err != nil {
+				return fmt.Errorf("failed to send final AUTH: %v", err)
+			}
+			if err := s.handleIKEAuthFinalResp(respData); err != nil {
+				return err
+			}
+		}
+	} // End of if !resumed block
 
 	s.Logger.Info("会话已建立", logger.Duration("handshake", time.Since(handshakeStart)))
 
@@ -635,6 +679,11 @@ func (s *Session) startNetEventMonitor() {
 							s.Logger.Warn("智能 DPD 探测失败", logger.Err(err))
 						}
 					}()
+				case ipsec.EventNATPortChanged:
+					// NAT-T 端口漂移：家庭路由器 NAT 映射翻新，底层已自动跟随
+					s.Logger.Info("NAT-T 端口悬浮：远端源端口已被底层自动跟随，隧道保持在线",
+						logger.Int("old_port", ev.OldPort),
+						logger.Int("new_port", ev.NewPort))
 				}
 			}
 		}
@@ -705,7 +754,7 @@ func (s *Session) startNATKeepalive(interval time.Duration) {
 
 // startIKESARekeyTimer 启动 IKE SA 生命周期管理
 // 定期触发 IKE SA Rekey，在 ePDG 8 分钟超时前刷新整个 IKE SA
-// 连续失败 rekeyMaxFail 次后触发隧道重建
+// 已经应用类似 strongSwan 的防爆破 jitter 分布
 func (s *Session) startIKESARekeyTimer(interval time.Duration) {
 	const rekeyMaxFail = 2
 
@@ -713,7 +762,9 @@ func (s *Session) startIKESARekeyTimer(interval time.Duration) {
 	s.rekeyResetCh = make(chan struct{}, 1)
 
 	go func() {
-		timer := time.NewTimer(interval)
+		// 引入随机的 jitter_time，提早 (0 ~ 30s) 行动以错开跟 ePDG 断链的强时间并发
+		jitter := time.Duration(rand.Int63n(int64(ikeRekeyJitter))) * time.Second
+		timer := time.NewTimer(interval - jitter)
 		defer timer.Stop()
 
 		failCount := 0
@@ -731,11 +782,12 @@ func (s *Session) startIKESARekeyTimer(interval time.Duration) {
 					default:
 					}
 				}
-				timer.Reset(interval)
-				s.Logger.Debug("IKE SA Rekey 成功，Timer 已重置",
-					logger.Duration("interval", interval))
+				jitter = time.Duration(rand.Int63n(int64(ikeRekeyJitter))) * time.Second
+				timer.Reset(interval - jitter)
+				s.Logger.Debug("IKE SA Rekey 成功，Timer 已重置并携带 Jitter",
+					logger.Duration("interval", interval-jitter))
 			case <-timer.C:
-				s.Logger.Info("IKE SA 生命周期到期，发起主动 IKE SA Rekey",
+				s.Logger.Info("IKE SA 生命周期即将到期，发起主动 IKE SA Rekey",
 					logger.Duration("interval", interval))
 				if err := s.RekeyIKESA(); err != nil {
 					failCount++
@@ -756,7 +808,8 @@ func (s *Session) startIKESARekeyTimer(interval time.Duration) {
 					timer.Reset(60 * time.Second)
 				} else {
 					failCount = 0
-					timer.Reset(interval)
+					jitter = time.Duration(rand.Int63n(int64(ikeRekeyJitter))) * time.Second
+					timer.Reset(interval - jitter)
 				}
 			}
 		}

@@ -45,6 +45,20 @@ type Config struct {
 	EnableWiresharkKeyLog bool
 	WiresharkKeyLogPath   string
 
+	// RFC 5723: Session Resumption 跨会话凭证漂流保护
+	ResumeTicket   []byte
+	ResumeOldSKd   []byte
+	OnTicketUpdate func(ticket, skd []byte)
+
+	// RFC 4187: EAP-AKA Fast Re-authentication 跨会话快速重连
+	// 从 ePDG 鉴权成功后提取的假名 ID 和密钥材料，用于下次断线重连时
+	// 绕过物理 SIM 卡读取（AT+CSIM），实现 0-RTT 的极速软鉴权
+	FastReauthID       string                                        // 来自 AT_NEXT_REAUTH_ID 的临时假名
+	FastReauthMK       []byte                                        // Master Key (上次全量认证派生)
+	FastReauthKAut     []byte                                        // K_Aut (用于 MAC 校验)
+	FastReauthKEncr    []byte                                        // K_Encr (用于属性加密)
+	OnFastReauthUpdate func(reauthID string, mk, kAut, kEncr []byte) // 外层持久化回调
+
 	TransportFactory func(local string, remote string) (Transport, error)
 	TUNFactory       func(name string) (TUN, error)
 	NetTools         NetTools

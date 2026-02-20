@@ -30,10 +30,11 @@ const (
 type ExchangeType uint8
 
 const (
-	IKE_SA_INIT     ExchangeType = 34
-	IKE_AUTH        ExchangeType = 35
-	CREATE_CHILD_SA ExchangeType = 36
-	INFORMATIONAL   ExchangeType = 37
+	IKE_SA_INIT        ExchangeType = 34
+	IKE_AUTH           ExchangeType = 35
+	CREATE_CHILD_SA    ExchangeType = 36
+	INFORMATIONAL      ExchangeType = 37
+	IKE_SESSION_RESUME ExchangeType = 38 // RFC 5723: Session Resumption
 )
 
 // 协议 ID
@@ -176,6 +177,13 @@ const (
 
 	REDIRECT_SUPPORTED uint16 = 16406 // RFC 5685: 支持重定向
 	REDIRECT           uint16 = 16407 // RFC 5685: 重定向到其他网关
+
+	// RFC 5723: Session Resumption
+	TICKET_LT_OPAQUE uint16 = 16409
+	TICKET_REQUEST   uint16 = 16410
+	TICKET_ACK       uint16 = 16411
+	TICKET_NACK      uint16 = 16412
+	TICKET_OPAQUE    uint16 = 16413
 
 	EAP_ONLY_AUTHENTICATION uint16 = 16417 // RFC 5998: 仅 EAP 认证
 

@@ -210,6 +210,31 @@ func (s *SocketManager) readLoop() {
 			continue
 		}
 
+		// NAT-T 端口漂移检测 (RFC 3947/3948)
+		// 如果来源 IP 校验通过但端口发生变化，说明家庭路由器的 NAT 映射已被翻新
+		s.remoteMu.Lock()
+		if addr.Port != s.RemoteAddr.Port && addr.Port > 0 {
+			oldPort := s.RemoteAddr.Port
+			s.RemoteAddr.Port = addr.Port
+			s.remoteMu.Unlock()
+			logger.Info("NAT-T 端口漂移检测：远端源端口发生变化，已动态跟随",
+				logger.Int("old_port", oldPort),
+				logger.Int("new_port", addr.Port),
+				logger.String("remote_ip", addr.IP.String()))
+			// 通知上层会话（非阻塞）
+			select {
+			case s.NetEvents <- NetEvent{
+				Type:    EventNATPortChanged,
+				OldPort: oldPort,
+				NewPort: addr.Port,
+				Reason:  fmt.Sprintf("NAT port changed %d -> %d", oldPort, addr.Port),
+			}:
+			default:
+			}
+		} else {
+			s.remoteMu.Unlock()
+		}
+
 		data := make([]byte, n)
 		copy(data, buf[:n])
 

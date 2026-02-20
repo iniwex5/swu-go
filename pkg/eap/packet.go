@@ -16,15 +16,17 @@ const (
 // EAP 类型
 const (
 	TypeIdentity = 1
-	TypeAKA      = 23
+	TypeAKA      = 23 // EAP-AKA (RFC 4187, 4G)
+	TypeAKAPrime = 50 // EAP-AKA' (RFC 5448, 5G)
 )
 
 // EAP-AKA 子类型
 const (
-	SubtypeChallenge   = 1
-	SubtypeAuthReject  = 2
-	SubtypeSyncFailure = 4
-	SubtypeIdentity    = 5
+	SubtypeChallenge        = 1
+	SubtypeAuthReject       = 2
+	SubtypeSyncFailure      = 4
+	SubtypeIdentity         = 5
+	SubtypeReauthentication = 13 // Fast Re-authentication (RFC 4187 §5)
 )
 
 // AKA 属性
@@ -34,6 +36,7 @@ const (
 	AT_RES               = 3
 	AT_AUTS              = 4
 	AT_PADDING           = 6
+	AT_NONCE_MT          = 7
 	AT_PERMANENT_ID_REQ  = 10
 	AT_MAC               = 11
 	AT_NOTIFICATION      = 12
@@ -45,8 +48,13 @@ const (
 	AT_COUNTER_TOO_SMALL = 20
 	AT_NONCE_S           = 21
 	AT_CLIENT_ERROR_CODE = 22
-	AT_CHECKCODE         = 23 // 用于 EAP-AKA' (Prime) 但检查 AKA... AKA 也有 Checkcode?
-	// RFC 4187 (EAP-AKA): 使用 AT_CHECKCODE (23)。
+	AT_CHECKCODE         = 23
+	AT_KDF_INPUT         = 23  // AKA' 专用: 网络名称输入 (RFC 5448 §3.1)，与 AT_CHECKCODE 共用编号但在 Type 50 下语义不同
+	AT_KDF               = 24  // AKA' 专用: KDF 协商标识 (RFC 5448 §3.2)
+	AT_IV                = 129 // 加密向量 (RFC 4187 §10.12)
+	AT_ENCR_DATA         = 130 // 加密数据 (RFC 4187 §10.12)
+	AT_NEXT_PSEUDONYM    = 132 // 下次的临时假名
+	AT_NEXT_REAUTH_ID    = 133 // 下次的快速重认证 ID (RFC 4187 §10.15)
 )
 
 type EAPPacket struct {
