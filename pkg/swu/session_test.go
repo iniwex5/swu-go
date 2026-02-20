@@ -48,9 +48,8 @@ func TestGenerateIKESAKeys(t *testing.T) {
 
 func TestEncryptDecrypt(t *testing.T) {
 	s := &Session{
-		SPIi:           0x1122334455667788,
-		SPIr:           0x8877665544332211,
-		SequenceNumber: 1,
+		SPIi: 0x1122334455667788,
+		SPIr: 0x8877665544332211,
 	}
 
 	// Setup Keys for GCM

@@ -187,3 +187,10 @@ const (
 	DEVICE_IDENTITY      uint16 = 16432 // 3GPP TS 24.302: 设备身份
 	DEVICE_IDENTITY_3GPP uint16 = 41101 // 3GPP 私有: 设备身份（IMEI）
 )
+
+// RFC 5685 Redirect Gateway Identity Type
+const (
+	RedirectGWIPv4 uint8 = 1
+	RedirectGWIPv6 uint8 = 2
+	RedirectGWFQDN uint8 = 3
+)

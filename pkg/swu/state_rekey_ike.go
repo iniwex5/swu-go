@@ -182,7 +182,7 @@ func (s *Session) handleRekeyIKESAResp(
 	s.SPIi = newSPIi
 	s.SPIr = newSPIr
 	s.Keys = newKeys
-	s.SequenceNumber = 0 // 新 IKE SA 的 MsgID 从 0 开始
+	s.SequenceNumber.Store(0) // 新 IKE SA 的 MsgID 从 0 开始
 	s.DH = newDH         // 更新 DH 状态
 
 	s.Logger.Info("IKE SA Rekey 成功",
@@ -308,7 +308,7 @@ func (s *Session) HandleRekeyIKESARequest(msgID uint32, payloads []ikev2.Payload
 	s.SPIi = peerSPI
 	s.SPIr = newSPIr
 	s.Keys = newKeys
-	s.SequenceNumber = 0
+	s.SequenceNumber.Store(0)
 	s.DH = newDH
 	s.lastRekeyTime = time.Now()
 	s.rekeyMu.Unlock()

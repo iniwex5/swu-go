@@ -49,6 +49,12 @@ func (s *Session) ikeDispatchLoop() {
 			}
 
 			if hdr.Flags&ikev2.FlagResponse != 0 {
+				// 新机制：拦截包体交付给滑动窗口调度器
+				if handled := s.taskMgr.HandleResponse(hdr.MessageID, data); handled {
+					continue
+				}
+
+				// 旧机制保留用于支持零星写死的 ikeWaiters
 				key := ikeWaitKey{exchangeType: hdr.ExchangeType, msgID: hdr.MessageID}
 				s.ikeMu.Lock()
 				ch := s.ikeWaiters[key]
@@ -151,15 +157,15 @@ func (s *Session) handleIncomingInformational(data []byte) error {
 					logger.Uint32("pendingNum", pendingNum),
 					logger.Uint32("expectedSend", expectedSend),
 					logger.Uint32("expectedRecv", expectedRecv),
-					logger.Uint32("currentSeqNum", s.SequenceNumber))
+					logger.Uint32("currentSeqNum", s.SequenceNumber.Load()))
 
 				// 更新本端 SequenceNumber：对端期望从我们收到的下一个 ID
 				// 只允许向前调整（防止回退攻击）
-				if expectedRecv > s.SequenceNumber {
+				if expectedRecv > s.SequenceNumber.Load() {
 					s.Logger.Info("MID Sync: 更新 SequenceNumber",
-						logger.Uint32("old", s.SequenceNumber),
+						logger.Uint32("old", s.SequenceNumber.Load()),
 						logger.Uint32("new", expectedRecv))
-					s.SequenceNumber = expectedRecv
+					s.SequenceNumber.Store(expectedRecv)
 				}
 
 				// 回复 MID Sync 响应（RFC 6311 §5.2）
@@ -167,7 +173,7 @@ func (s *Session) handleIncomingInformational(data []byte) error {
 				// 其中 EXPECTED_SEND = 我们下一个要发送的 MsgID (SequenceNumber)
 				// EXPECTED_RECV = msgID + 1 (我们期望对端的下一个请求 ID)
 				respData := make([]byte, 8)
-				binary.BigEndian.PutUint32(respData[0:4], s.SequenceNumber)
+				binary.BigEndian.PutUint32(respData[0:4], s.SequenceNumber.Load())
 				binary.BigEndian.PutUint32(respData[4:8], msgID+1)
 				syncResp := &ikev2.EncryptedPayloadNotify{
 					ProtocolID: 0,
@@ -214,6 +220,24 @@ func (s *Session) handleIncomingInformational(data []byte) error {
 					return s.sendEncryptedResponseWithMsgID(respPayloads, ikev2.INFORMATIONAL, msgID)
 				} else {
 					s.Logger.Warn("收到 UPDATE_SA_ADDRESSES 但 MOBIKE 未协商")
+				}
+				continue
+			}
+			// RFC 5685: REDIRECT — 网关主动要求回弹重连
+			if notify.NotifyType == ikev2.REDIRECT {
+				addr, err := ParseRedirectData(notify.NotifyData)
+				if err != nil {
+					s.Logger.Warn("解析运行期 REDIRECT 负载失败", logger.Err(err))
+				} else {
+					s.Logger.Warn("收到 ePDG 下发的代理转移指令 (REDIRECT)，即将断开重连", logger.String("newAddr", addr))
+					if s.OnRedirect != nil {
+						go s.OnRedirect(addr)
+					}
+					if s.OnSessionDown != nil {
+						go s.OnSessionDown()
+					} else if s.cancel != nil {
+						s.cancel()
+					}
 				}
 				continue
 			}

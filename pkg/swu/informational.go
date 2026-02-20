@@ -8,9 +8,10 @@ import (
 	"github.com/iniwex5/swu-go/pkg/logger"
 )
 
-// sendDPD 发送 Dead Peer Detection 请求
+// sendDPD 发送 Dead Peer Detection 请求，返回的 err 仅指打包入列错误
 func (s *Session) sendDPD() error {
-	s.Logger.Debug("发送 DPD 请求")
+	s.Logger.Debug("发送 DPD 请求 (通过并发窗口队列)")
+	// 滑动窗口已经接管了超时重试惩罚，这句 send 函数其实就是投信箱拿号过程。
 	_, err := s.sendEncryptedWithRetry(nil, ikev2.INFORMATIONAL)
 	return err
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"sync/atomic"
 
 	"sync"
 	"time"
@@ -44,7 +45,7 @@ type Session struct {
 
 	Keys *ikev2.IKESAKeys
 
-	SequenceNumber uint32 // IKE 消息 ID
+	SequenceNumber atomic.Uint32 // IKE 消息 ID (利用原子操作支持并发挂窗)
 
 	ikeEncrID  uint16
 	ikeIntegID uint16
@@ -84,6 +85,9 @@ type Session struct {
 
 	// 隧道断线回调（Hard Expire / DPD 连续失败时调用）
 	OnSessionDown func()
+
+	// 代理重定向回调 (RFC 5685 REDIRECT 要求切换网关)
+	OnRedirect func(newAddr string)
 
 	// Rekey 互斥锁（防止两个 SPI 的 expire 同时触发）
 	rekeyMu sync.Mutex
@@ -130,7 +134,7 @@ type Session struct {
 	cancel        context.CancelFunc
 	reauthTrigger chan struct{} // 触发 Reauth 的信号通道
 
-	retryCtx *RetryContext
+	taskMgr *TaskManager // 取代了 retryCtx，滑动窗口与并发队列调度器
 
 	ws *WiresharkDebugger
 
@@ -179,7 +183,6 @@ func NewSession(cfg *Config, l *zap.Logger) *Session {
 		Logger:           l,
 		net:              netTools,
 		SPIi:             spii,
-		SequenceNumber:   0,
 		ChildSAsIn:       make(map[uint32]*ipsec.SecurityAssociation),
 		ikeWaiters:       make(map[ikeWaitKey]chan []byte),
 		ikePending:       make(map[ikeWaitKey][]byte),
@@ -234,7 +237,11 @@ func (s *Session) Connect(ctx context.Context) error {
 func (s *Session) connectOnce() error {
 	handshakeStart := time.Now()
 	var err error
-	s.retryCtx = NewRetryContext(s.ctx, nil)
+
+	s.Logger.Debug("初始化滑动窗口队列任务调度器 TaskManager", logger.Int("windowSize", 5))
+
+	// 在 Socket 启动前暂不配置 sendFunc，等到下面 socket.Start() 之后重载
+	s.taskMgr = NewTaskManager(s.ctx, nil, 5, nil)
 
 	// 1. 设置网络 (Socket)
 	localPort := s.cfg.LocalPort
@@ -254,10 +261,19 @@ func (s *Session) connectOnce() error {
 			s.socket, err = ipsec.NewSocketManager(localBind, remoteAddr, s.cfg.DNSServer)
 		}
 	}
+	if err != nil {
+		return fmt.Errorf("failed to bind socket: %v", err)
+	}
 	s.socket.Start()
 	defer s.socket.Stop()
 
+	// 把 socket 的发包句柄挂载到滑动窗口调度器
+	s.taskMgr.sendFunc = s.socket.SendIKE
+
 	s.startNetEventMonitor()
+
+	// 在发出第一包前，必须启动 IKE_Control 接收器，否则并发抛射出的响应无法解锁
+	s.ensureIKEDispatcher()
 
 	if sm, ok := s.socket.(interface {
 		LocalAddrString() string
@@ -279,13 +295,18 @@ func (s *Session) connectOnce() error {
 			return err
 		}
 
-		respData, err := s.retryCtx.SendWithRetry(
-			s.socket.SendIKE,
-			s.receiveIKEWithTimeout,
-			reqData,
-		)
-		if err != nil {
-			return err
+		// 异步推送，并挂起等待窗口的回执通道
+		compCh := s.taskMgr.EnqueueRequest(0, ikev2.IKE_SA_INIT, nil, reqData)
+
+		var respData []byte
+		var ok bool
+		select {
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		case respData, ok = <-compCh:
+			if !ok || respData == nil {
+				return ErrWindowTimeout
+			}
 		}
 
 		if err := s.handleIKESAInitResp(respData); err != nil {
@@ -298,7 +319,7 @@ func (s *Session) connectOnce() error {
 	}
 
 	s.Logger.Debug("IKE_SA_INIT 完成，密钥已生成")
-	s.SequenceNumber = 1
+	s.SequenceNumber.Store(1)
 
 	s.ws, err = NewWiresharkDebugger(s.cfg.EnableWiresharkKeyLog, s.cfg.WiresharkKeyLogPath)
 	if err != nil {
@@ -1802,8 +1823,8 @@ func (s *Session) receiveIKEResponseWithTimeout(exchangeType ikev2.ExchangeType,
 }
 
 func (s *Session) sendEncryptedWithRetry(payloads []ikev2.Payload, exchangeType ikev2.ExchangeType) ([]byte, error) {
-	if s.retryCtx == nil {
-		return nil, errors.New("重传上下文未初始化")
+	if s.taskMgr == nil {
+		return nil, errors.New("任务调度器未初始化")
 	}
 
 	// IKE Fragmentation (RFC 7383): 如果消息过大且对端支持分片，则分片发送
@@ -1815,7 +1836,8 @@ func (s *Session) sendEncryptedWithRetry(payloads []ikev2.Payload, exchangeType 
 		if len(packets) > 0 {
 			// 分片模式: 发送所有分片，等待最后一个分片的响应
 			// 所有分片共享同一个 Message ID
-			msgID := s.SequenceNumber - 1
+			// 获取由上方的 NextSequenceNumber 取出但在 encryptWrapper 里被自增过的尾号
+			msgID := s.SequenceNumber.Load() - 1
 			for _, pkt := range packets {
 				if err := s.socket.SendIKE(pkt); err != nil {
 					return nil, fmt.Errorf("发送 IKE 分片失败: %v", err)
@@ -1831,7 +1853,7 @@ func (s *Session) sendEncryptedWithRetry(payloads []ikev2.Payload, exchangeType 
 	if err != nil {
 		return nil, err
 	}
-	msgID := s.SequenceNumber - 1
+	msgID := s.SequenceNumber.Load() - 1
 	s.lastEncryptedMsg = packetData
 	s.lastEncryptedMsgID = msgID
 	logger.Debug("发送加密 IKE 消息",
@@ -1844,17 +1866,17 @@ func (s *Session) sendEncryptedWithRetry(payloads []ikev2.Payload, exchangeType 
 	// 更新出站时间戳（与 strongSwan stats[STAT_OUTBOUND] 一致）
 	s.lastOutboundTime = time.Now()
 
-	return s.retryCtx.SendWithRetry(
-		func(data []byte) error {
-			err := s.socket.SendIKE(data)
-			if err == nil {
-				s.lastOutboundTime = time.Now()
-			}
-			return err
-		},
-		func(timeout time.Duration) ([]byte, error) {
-			return s.receiveIKEResponseWithTimeout(exchangeType, msgID, timeout)
-		},
-		packetData,
-	)
+	// 异步推送进滑动窗口队列
+	compCh := s.taskMgr.EnqueueRequest(msgID, exchangeType, payloads, packetData)
+
+	// 这里仍然需要向外层提供同步的 `[]byte` 返回语义，但是不会在重试循环里死耗
+	select {
+	case <-s.ctx.Done():
+		return nil, s.ctx.Err()
+	case resp, ok := <-compCh:
+		if !ok || resp == nil {
+			return nil, ErrWindowTimeout
+		}
+		return resp, nil
+	}
 }

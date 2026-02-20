@@ -524,7 +524,7 @@ func (s *Session) handleIKEAuthFinalResp(data []byte) error {
 			}
 			// RFC 5685: REDIRECT
 			if p.NotifyType == ikev2.REDIRECT {
-				addr, err := parseRedirectData(p.NotifyData)
+				addr, err := ParseRedirectData(p.NotifyData)
 				if err != nil {
 					s.Logger.Warn("解析 REDIRECT 数据失败", logger.Err(err))
 				} else {

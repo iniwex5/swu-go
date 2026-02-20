@@ -278,6 +278,5 @@ func (s *Session) encryptAndWrapWithMsgID(payloads []ikev2.Payload, exchangeType
 }
 
 func (s *Session) NextSequenceNumber() uint32 {
-	s.SequenceNumber++
-	return s.SequenceNumber - 1
+	return s.SequenceNumber.Add(1) - 1
 }

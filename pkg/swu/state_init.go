@@ -222,7 +222,7 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 			}
 			// RFC 5685: REDIRECT
 			if v.NotifyType == ikev2.REDIRECT {
-				addr, err := parseRedirectData(v.NotifyData)
+				addr, err := ParseRedirectData(v.NotifyData)
 				if err != nil {
 					s.Logger.Warn("解析 REDIRECT 数据失败", logger.Err(err))
 				} else {
@@ -354,7 +354,7 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 	return nil
 }
 
-func parseRedirectData(data []byte) (string, error) {
+func ParseRedirectData(data []byte) (string, error) {
 	if len(data) < 1 {
 		return "", errors.New("empty redirect data")
 	}
@@ -362,17 +362,17 @@ func parseRedirectData(data []byte) (string, error) {
 	gwData := data[1:]
 
 	switch gwType {
-	case 1: // IPv4
+	case ikev2.RedirectGWIPv4: // IPv4
 		if len(gwData) != 4 {
 			return "", fmt.Errorf("invalid IPv4 length: %d", len(gwData))
 		}
 		return net.IP(gwData).String(), nil
-	case 2: // IPv6
+	case ikev2.RedirectGWIPv6: // IPv6
 		if len(gwData) != 16 {
 			return "", fmt.Errorf("invalid IPv6 length: %d", len(gwData))
 		}
 		return net.IP(gwData).String(), nil
-	case 3: // FQDN
+	case ikev2.RedirectGWFQDN: // FQDN
 		return string(gwData), nil
 	default:
 		return "", fmt.Errorf("unknown gateway identity type: %d", gwType)
