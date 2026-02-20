@@ -23,8 +23,9 @@ type SocketManager struct {
 	remoteMu   sync.Mutex
 	remoteIdx  uint32
 
-	IKEChan chan []byte
-	ESPChan chan []byte
+	IKEChan   chan []byte
+	ESPChan   chan []byte
+	NetEvents chan NetEvent // 网络底层事件通道 (PMTU / ICMP Error)
 
 	closeChan chan struct{}
 	wg        sync.WaitGroup
@@ -41,6 +42,10 @@ func (s *SocketManager) IKEPackets() <-chan []byte {
 
 func (s *SocketManager) ESPPackets() <-chan []byte {
 	return s.ESPChan
+}
+
+func (s *SocketManager) NetEventsChan() <-chan NetEvent {
+	return s.NetEvents
 }
 
 func NewSocketManager(local, remote string, dnsServer string) (*SocketManager, error) {
@@ -78,6 +83,7 @@ func NewSocketManager(local, remote string, dnsServer string) (*SocketManager, e
 		remoteIPs:  remoteIPs,
 		IKEChan:    make(chan []byte, 100),
 		ESPChan:    make(chan []byte, 1000), // 数据平面的更高缓冲区
+		NetEvents:  make(chan NetEvent, 10),
 		closeChan:  make(chan struct{}),
 	}, nil
 }
@@ -152,6 +158,13 @@ func resolveUDPAddrAll(addr string, dnsServer string) (*net.UDPAddr, []net.IP, e
 func (s *SocketManager) Start() {
 	s.wg.Add(1)
 	go s.readLoop()
+
+	// 启动 ICMP MSG_ERRQUEUE 错误监听
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.startErrorListener()
+	}()
 }
 
 func (s *SocketManager) Stop() {
@@ -164,6 +177,7 @@ func (s *SocketManager) Stop() {
 	s.wg.Wait()
 	close(s.IKEChan)
 	close(s.ESPChan)
+	close(s.NetEvents)
 }
 
 func (s *SocketManager) readLoop() {

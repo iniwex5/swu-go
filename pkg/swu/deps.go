@@ -1,5 +1,7 @@
 package swu
 
+import "github.com/iniwex5/swu-go/pkg/ipsec"
+
 type Transport interface {
 	Start()
 	Stop()
@@ -7,6 +9,7 @@ type Transport interface {
 	SendESP([]byte) error
 	IKEPackets() <-chan []byte
 	ESPPackets() <-chan []byte
+	NetEventsChan() <-chan ipsec.NetEvent
 }
 
 type TUN interface {
@@ -24,4 +27,3 @@ type NetTools interface {
 	AddAddress6(iface string, cidr string) error
 	AddRoute6(cidr string, gw string, iface string) error
 }
-

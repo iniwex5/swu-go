@@ -122,6 +122,7 @@ type Session struct {
 
 	mobikeSupported        bool            // 对端是否支持 MOBIKE (RFC 4555)
 	fragmentationSupported bool            // 对端是否支持 IKE Fragmentation (RFC 7383)
+	ikeFragmentMTU         uint32          // 动态探测的当前 IKE 最大分片大小
 	fragmentBuf            *fragmentBuffer // IKE Fragmentation 接收缓冲区
 
 	// 生命周期管理
@@ -186,6 +187,7 @@ func NewSession(cfg *Config, l *zap.Logger) *Session {
 		done:             make(chan struct{}),
 		reauthTrigger:    make(chan struct{}, 1),
 		fragmentBuf:      newFragmentBuffer(),
+		ikeFragmentMTU:   1280, // Default MTU
 	}
 }
 
@@ -252,11 +254,10 @@ func (s *Session) connectOnce() error {
 			s.socket, err = ipsec.NewSocketManager(localBind, remoteAddr, s.cfg.DNSServer)
 		}
 	}
-	if err != nil {
-		return fmt.Errorf("failed to bind socket: %v", err)
-	}
 	s.socket.Start()
 	defer s.socket.Stop()
+
+	s.startNetEventMonitor()
 
 	if sm, ok := s.socket.(interface {
 		LocalAddrString() string
@@ -574,6 +575,49 @@ func (s *Session) logSessionStats(interval time.Duration) {
 			// }
 		}
 	}
+}
+
+// startNetEventMonitor 监听 Socket 层传递来的底层异常 (ICMP)
+func (s *Session) startNetEventMonitor() {
+	evChan := s.socket.NetEventsChan()
+	if evChan == nil {
+		return
+	}
+	go func() {
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case ev, ok := <-evChan:
+				if !ok {
+					return
+				}
+				s.Logger.Debug("收到底层网络事件", logger.Any("event", ev))
+
+				switch ev.Type {
+				case ipsec.EventPathMTU:
+					// 收到 ICMP Fragmentation Needed，自动调低 PMTU
+					if ev.PMTU < s.ikeFragmentMTU && ev.PMTU >= 500 {
+						s.Logger.Warn("收到 ICMP Frag Needed，动态调低 IKE PMTU",
+							logger.Uint32("old", s.ikeFragmentMTU),
+							logger.Uint32("new", ev.PMTU))
+						s.ikeFragmentMTU = ev.PMTU
+						// 可选验证：若有 XFRMI 等接口，也可尝试调用 s.net.SetMTU(iface, ev.PMTU)
+					}
+				case ipsec.EventNetworkDown:
+					// ICMP Host/Net Unreachable，提前触发生态保护，绕开死等 keepalive
+					s.Logger.Warn("基站/路由器发来链路断开 ICMP (Host Unreachable)，触发 DPD/MOBIKE 预判探活",
+						logger.String("reason", ev.Reason))
+					// 直接发起一次 DPD 加速验证，如果在发 DPD 期间发生漂移将直接救活。
+					go func() {
+						if err := s.sendDPD(); err != nil {
+							s.Logger.Warn("智能 DPD 探测失败", logger.Err(err))
+						}
+					}()
+				}
+			}
+		}
+	}()
 }
 
 // startNATKeepalive 启动 NAT keepalive（对齐 strongSwan ike_sa.c:send_keepalive）
@@ -1386,9 +1430,7 @@ func (s *Session) applyNetworkConfigOnTUN(iface string) error {
 				if err := s.net.AddAddress(iface, cidr); err != nil {
 					return err
 				}
-				if deleter != nil {
-					s.netUndos = append(s.netUndos, func() error { return deleter.DelAddress(iface, cidr) })
-				}
+				// 优化: 删除接口时 IP 地址会自动被内核回收，不再记录 O(N) 的 DelAddress
 			}
 		}
 		if len(s.cpConfig.IPv6Addresses) > 0 {
@@ -1398,9 +1440,7 @@ func (s *Session) applyNetworkConfigOnTUN(iface string) error {
 				if err := s.net.AddAddress6(iface, cidr); err != nil {
 					return err
 				}
-				if deleter != nil {
-					s.netUndos = append(s.netUndos, func() error { return deleter.DelAddress6(iface, cidr) })
-				}
+				// 优化: IPv6 同样随接口销毁
 			}
 		}
 	}
@@ -1430,6 +1470,7 @@ func (s *Session) applyNetworkConfigOnTUN(iface string) error {
 		DelRule(srcCIDR string, table int) error
 		AddInputRule(iface string, table int) error
 		DelInputRule(iface string, table int) error
+		FlushRules(table int, iface string) error
 		CleanConflictRoutes(cidrs []string, keepIface string, family int)
 		SetSysctl(key, value string) error
 	}
@@ -1503,13 +1544,14 @@ func (s *Session) applyNetworkConfigOnTUN(iface string) error {
 		if err == nil {
 			tableID := link.Attrs().Index + 1000
 
+			// O(1) 清理: 只注册一次 FlushRules 把与该设备(table/iface)相关的所有 rule 清除
+			s.netUndos = append(s.netUndos, func() error { return pr.FlushRules(tableID, iface) })
+
 			// 1. 添加基于入站接口 (iif) 的策略路由规则：iif <iface> lookup <tableID>
 			// 这解决了 RPF (反向路径过滤) 问题：确保入站包能匹配到正确的路由表
 			if err := pr.AddInputRule(iface, tableID); err != nil {
 				return err
 			}
-			tbl := tableID
-			s.netUndos = append(s.netUndos, func() error { return pr.DelInputRule(iface, tbl) })
 
 			// 2. 添加基于源地址的策略路由规则：from <设备IP> lookup <tableID>
 			var srcCIDRs []string
@@ -1531,28 +1573,19 @@ func (s *Session) applyNetworkConfigOnTUN(iface string) error {
 				if err := pr.AddRule(src, tableID); err != nil {
 					return err
 				}
-				srcCopy := src
-				tbl := tableID
-				s.netUndos = append(s.netUndos, func() error { return pr.DelRule(srcCopy, tbl) })
 			}
 
-			// 再添加路由到独立路由表
+			// 再添加路由到独立路由表 (路由表随接口 LinkDown 而内核自动隐式销毁)
 			for _, cidr := range routes {
 				if err := pr.AddRouteTable(cidr, iface, tableID); err != nil {
 					return err
 				}
-				c := cidr
-				tbl := tableID
-				s.netUndos = append(s.netUndos, func() error { return pr.DelRouteTable(c, iface, tbl) })
 			}
 			for _, cidr := range routes6 {
 				// Revert: StrongSwan uses direct routes. Let's try direct routes again with ARP enabled.
 				if err := pr.AddRouteTable(cidr, iface, tableID); err != nil {
 					return err
 				}
-				c := cidr
-				tbl := tableID
-				s.netUndos = append(s.netUndos, func() error { return pr.DelRouteTable(c, iface, tbl) })
 			}
 
 			// [清理 main 表冲突路由]

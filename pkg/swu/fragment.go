@@ -146,7 +146,7 @@ func (s *Session) fragmentMessage(payloads []ikev2.Payload, exchangeType ikev2.E
 	}
 
 	// 可用空间 = MTU - IKE Header - SKF Header(4+4) - IV - ICV
-	fragMTU := defaultFragmentMTU
+	fragMTU := int(s.ikeFragmentMTU)
 	maxPlaintextPerFrag := fragMTU - ikeOverhead - ivSize - icvSize
 	if maxPlaintextPerFrag <= 0 {
 		return nil, errors.New("分片 MTU 太小")
@@ -384,5 +384,5 @@ func (s *Session) shouldFragment(payloads []ikev2.Payload) bool {
 		totalSize += 16 // GCM tag
 	}
 
-	return totalSize > defaultFragmentMTU
+	return totalSize > int(s.ikeFragmentMTU)
 }

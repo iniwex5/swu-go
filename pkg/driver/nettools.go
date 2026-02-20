@@ -429,6 +429,22 @@ func (n *NetTools) DelInputRule(iface string, table int) error {
 	return wrapErr("rule del", fmt.Sprintf("iif %s lookup %d", iface, table), err)
 }
 
+// FlushRules (O(1) 优化) 批量清除与特定表和接口相关的策略路由规则，防止设备离线雪崩
+func (n *NetTools) FlushRules(table int, iface string) error {
+	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
+		rules, err := netlink.RuleList(family)
+		if err != nil {
+			continue
+		}
+		for _, r := range rules {
+			if r.Table == table || r.IifName == iface {
+				_ = netlink.RuleDel(&r)
+			}
+		}
+	}
+	return nil
+}
+
 // CleanConflictRoutes 删除 main 表中指向非指定接口的冲突路由
 // 用于清理其他设备或旧 session 残留的 P-CSCF 路由（如 dev ens2），
 // 避免这些路由抢占策略路由导致流量走物理接口而非 XFRM 隧道。
