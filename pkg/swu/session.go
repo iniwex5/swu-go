@@ -602,6 +602,15 @@ func (s *Session) cleanupNetworkConfig() {
 		}
 	}
 	s.netUndos = nil
+
+	// 在清理的最后，加入全局扫描与无情抹除，确保存留的因为 rekey 生成的新 SA 都一并被干掉而不会堵塞下一次建连
+	if s.xfrmMgr != nil && s.xfrmLocalIP != nil {
+		s.Logger.Debug("彻底肃清设备遗留的所有 XFRM SA 缓存...")
+		s.xfrmMgr.FlushByIP(s.xfrmLocalIP)
+		// 配合 Linux xfrm 机制：可以直接 flush
+		s.Logger.Debug("由于安全起见，本 ID 对应的资源已肃清.")
+	}
+
 	s.Logger.Info("网络配置清理完成")
 }
 
@@ -800,7 +809,8 @@ func (s *Session) startIKESARekeyTimer(interval time.Duration) {
 							logger.Int("maxFail", rekeyMaxFail))
 						if s.OnSessionDown != nil {
 							go s.OnSessionDown()
-						} else if s.cancel != nil {
+						}
+						if s.cancel != nil {
 							s.cancel()
 						}
 						return
@@ -865,7 +875,8 @@ func (s *Session) startChildSARekeyTimer(interval time.Duration) {
 							logger.Int("maxFail", rekeyMaxFail))
 						if s.OnSessionDown != nil {
 							go s.OnSessionDown()
-						} else if s.cancel != nil {
+						}
+						if s.cancel != nil {
 							s.cancel()
 						}
 						return

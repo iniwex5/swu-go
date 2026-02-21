@@ -92,9 +92,13 @@ func (s *Session) StartDPD(interval time.Duration) {
 					// 到达这里说明 ~165s 内全部超时，判定对端不可达
 					s.Logger.Error("DPD 重传耗尽，判定对端不可达",
 						logger.Err(err))
+
+					// 暴力掐除：立即发送底层断线回调
 					if s.OnSessionDown != nil {
 						go s.OnSessionDown()
-					} else if s.cancel != nil {
+					}
+					// 紧接着注销 Context 以打断本 Session 所有被挂起的任务和网络发包
+					if s.cancel != nil {
 						s.cancel()
 					}
 					return

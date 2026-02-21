@@ -314,6 +314,10 @@ func (s *SocketManager) SendNATKeepalive() error {
 	dst := *s.RemoteAddr
 	s.remoteMu.Unlock()
 	_, err := s.Conn.WriteToUDP([]byte{0xff}, &dst)
+	if err != nil {
+		// 捕捉 operation not permitted 这类 OS 级阻塞
+		logger.Warn("NAT keepalive 发送遭遇操作系统级拦截/拒绝", logger.Err(err), logger.String("dst", dst.String()), logger.String("local", s.LocalAddrString()))
+	}
 	return err
 }
 

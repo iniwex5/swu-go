@@ -233,6 +233,22 @@ func (x *XFRMManager) DelSA(spi uint32, src, dst net.IP, proto netlink.Proto) er
 	return nil
 }
 
+// FlushByIP 清理所有包含该 IP (作为 src 或 dst) 的 XFRM SA 记录。
+// 这可以防止会话崩溃后新建立的隧道 UDP 端口发送时被遗留路由拦截 (operation not permitted)。
+func (x *XFRMManager) FlushByIP(ip net.IP) {
+	if ip == nil {
+		return
+	}
+	states, err := netlink.XfrmStateList(netlink.FAMILY_ALL)
+	if err == nil {
+		for _, s := range states {
+			if s.Src.Equal(ip) || s.Dst.Equal(ip) {
+				_ = netlink.XfrmStateDel(&s)
+			}
+		}
+	}
+}
+
 // AddSP 添加 XFRM Security Policy
 func (x *XFRMManager) AddSP(cfg XFRMSPConfig) error {
 	policy := &netlink.XfrmPolicy{
