@@ -27,7 +27,7 @@ func (s *Session) Snapshot() SessionSnapshot {
 				out.Established = false
 			}
 			if s.xfrmMgr != nil {
-				out.TUNName = s.cfg.XFRMIfName
+				out.TUNName = s.cfg.TUNName
 			}
 		} else {
 			if out.Established && s.tun == nil {

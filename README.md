@@ -14,11 +14,14 @@
 - **Child SA Rekey** — 主动 + 被动，含碰撞检测 (TryLock)
 - **IKE SA Rekey** — 主动 + 被动，DH 密钥交换刷新
 - **IKE Reauthentication** — RFC 7296 §2.8.3 完全重认证
+- **EAP-AKA Fast Re-auth** — RFC 4187 0-RTT 极速伪装重认证，免 SIM 强验
+- **Session Resumption** — RFC 5723 跨会话凭证漂流保护与快速恢复
 - **AUTH Lifetime** — RFC 4478 动态适配 ePDG 通告的 SA 生命周期
 - **Soft/Hard Expire** — XFRM 内核事件驱动的 SA 过期处理
 - **DPD** — RFC 3706 Dead Peer Detection
 
 ### 网络适应性
+- **Smart DPD** — 基于 XFRM 底层流量感知的智能死穴检测 (Dead Peer Detection)
 - **NAT-T** — ESP-in-UDP 封装 + Keepalive
 - **MOBIKE** — RFC 4555 网络切换（WiFi ↔ 4G）无感迁移
 - **IKE Redirect** — RFC 5685 ePDG 负载均衡重定向
@@ -58,12 +61,24 @@ type Config struct {
     APN           string          // 接入点名称
     SIM           sim.SIMProvider // SIM 卡提供者
     DataplaneMode string          // "xfrmi" (推荐) 或 "tun"
-    XFRMIfName    string          // XFRM 接口名 (默认 "ipsec0")
+    TUNName       string          // 接口设备名 (默认 "ipsec0")
 
-    // 生命周期管理
+    // 流量与生存期管理
     ReauthInterval int  // IKE SA 重认证间隔（秒），0=禁用
     ReplayWindow   int  // XFRM 抗重放窗口 (默认 32, 建议 128/256)
     EnableESN      bool // 启用 64 位扩展序列号 (默认 false)
+
+    // RFC 5723 Ticket 凭证漂流保护
+    ResumeTicket   []byte
+    ResumeOldSKd   []byte
+    OnTicketUpdate func(ticket, skd []byte)
+
+    // 0-RTT 极速重建缓存 (可选，对接外层应用存储)
+    FastReauthID       string // ePDG 赋予的下次断线重连假名
+    FastReauthMK       []byte // 上次全量认证协商的根密钥
+    FastReauthKAut     []byte
+    FastReauthKEncr    []byte
+    OnFastReauthUpdate func(reauthID string, mk, kAut, kEncr []byte)
 }
 ```
 
@@ -86,7 +101,7 @@ func main() {
         APN:           "ims",
         SIM:           simProvider,
         DataplaneMode: "xfrmi",
-        XFRMIfName:    "ims0",
+        TUNName:       "ims0",
         ReplayWindow:  128,
     }
 
@@ -128,7 +143,7 @@ pkg/
     ├── state_rekey.go      # Child SA Rekey (主动)
     ├── state_rekey_ike.go  # IKE SA Rekey (主动 + 被动)
     ├── ike_control.go      # ePDG 发起的请求分发 (Rekey/Delete/MID Sync)
-    ├── informational.go    # DPD、Delete 通知
+    ├── informational.go    # 智能流量感知 DPD、Delete 通知
     ├── mobike.go           # MOBIKE 地址更新 (RFC 4555)
     ├── fragment.go         # IKE Fragmentation (RFC 7383)
     ├── cookie.go           # COOKIE 处理

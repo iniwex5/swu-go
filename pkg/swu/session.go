@@ -1105,7 +1105,7 @@ func (s *Session) setupXFRMDataPlane() error {
 	}
 
 	// 3. 创建 XFRM 接口
-	xfrmIfName := s.cfg.XFRMIfName
+	xfrmIfName := s.cfg.TUNName
 	if xfrmIfName == "" {
 		xfrmIfName = "ipsec0"
 	}
