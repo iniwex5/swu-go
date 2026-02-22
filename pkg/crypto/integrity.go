@@ -80,6 +80,23 @@ func (h *nullIntegrity) Verify(key, data, mac []byte) bool { return true }
 func (h *nullIntegrity) OutputSize() int                   { return 0 }
 func (h *nullIntegrity) KeySize() int                      { return 0 }
 
+// HMAC-SHA384-192 (截断到 192 位 = 24 字节)
+type hmacSHA384_192 struct{}
+
+func (h *hmacSHA384_192) Compute(key, data []byte) []byte {
+	mac := hmac.New(sha512.New384, key)
+	mac.Write(data)
+	return mac.Sum(nil)[:24]
+}
+
+func (h *hmacSHA384_192) Verify(key, data, expectedMAC []byte) bool {
+	computed := h.Compute(key, data)
+	return hmac.Equal(computed, expectedMAC)
+}
+
+func (h *hmacSHA384_192) OutputSize() int { return 24 }
+func (h *hmacSHA384_192) KeySize() int    { return 48 }
+
 // GetIntegrityAlgorithm 根据 ID 获取完整性算法
 func GetIntegrityAlgorithm(id uint16) (IntegrityAlgorithm, error) {
 	switch id {
@@ -89,6 +106,8 @@ func GetIntegrityAlgorithm(id uint16) (IntegrityAlgorithm, error) {
 		return &hmacSHA1_96{}, nil
 	case 12: // AUTH_HMAC_SHA2_256_128
 		return &hmacSHA256_128{}, nil
+	case 13: // AUTH_HMAC_SHA2_384_192
+		return &hmacSHA384_192{}, nil
 	case 14: // AUTH_HMAC_SHA2_512_256
 		return &hmacSHA512_256{}, nil
 	default:

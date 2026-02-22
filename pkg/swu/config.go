@@ -62,4 +62,9 @@ type Config struct {
 	TransportFactory func(local string, remote string) (Transport, error)
 	TUNFactory       func(name string) (TUN, error)
 	NetTools         NetTools
+
+	// 支持自定义的 IKEv2 和 ESP 协商组合列表。如果留空，将使用内置的大而全强兼容默认套件。
+	// 示例：[]string{"aes256gcm16-prfsha384-ecp384", "aes128-sha256-modp2048"}
+	IKEProposals []string
+	ESPProposals []string
 }

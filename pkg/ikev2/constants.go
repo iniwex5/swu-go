@@ -202,3 +202,134 @@ const (
 	RedirectGWIPv6 uint8 = 2
 	RedirectGWFQDN uint8 = 3
 )
+
+// IntegToString 将完整性算法 ID 转换为字符串描述
+
+func EncrToString(id uint16) string {
+	switch AlgorithmType(id) {
+	case ENCR_DES_IV64:
+		return "DES_IV64"
+	case ENCR_DES:
+		return "DES"
+	case ENCR_3DES:
+		return "3DES"
+	case ENCR_RC5:
+		return "RC5"
+	case ENCR_IDEA:
+		return "IDEA"
+	case ENCR_CAST:
+		return "CAST"
+	case ENCR_BLOWFISH:
+		return "BLOWFISH"
+	case ENCR_3IDEA:
+		return "3IDEA"
+	case ENCR_DES_IV32:
+		return "DES_IV32"
+	case ENCR_NULL:
+		return "NULL"
+	case ENCR_AES_CBC:
+		return "AES_CBC"
+	case ENCR_AES_CTR:
+		return "AES_CTR"
+	case ENCR_AES_CCM_8:
+		return "AES_CCM_8"
+	case ENCR_AES_CCM_12:
+		return "AES_CCM_12"
+	case ENCR_AES_CCM_16:
+		return "AES_CCM_16"
+	case ENCR_AES_GCM_8:
+		return "AES_GCM_8"
+	case ENCR_AES_GCM_12:
+		return "AES_GCM_12"
+	case ENCR_AES_GCM_16:
+		return "AES_GCM_16"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+func PRFToString(id uint16) string {
+	switch AlgorithmType(id) {
+	case PRF_HMAC_MD5:
+		return "HMAC_MD5"
+	case PRF_HMAC_SHA1:
+		return "HMAC_SHA1"
+	case PRF_HMAC_TIGER:
+		return "HMAC_TIGER"
+	case PRF_AES128_XCBC:
+		return "AES128_XCBC"
+	case PRF_HMAC_SHA2_256:
+		return "HMAC_SHA2_256"
+	case PRF_HMAC_SHA2_384:
+		return "HMAC_SHA2_384"
+	case PRF_HMAC_SHA2_512:
+		return "HMAC_SHA2_512"
+	case PRF_AES128_CMAC:
+		return "AES128_CMAC"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+func IntegToString(id uint16) string {
+	switch AlgorithmType(id) {
+	case AUTH_NONE:
+		return "NONE"
+	case AUTH_HMAC_MD5_96:
+		return "HMAC_MD5_96"
+	case AUTH_HMAC_SHA1_96:
+		return "HMAC_SHA1_96"
+	case AUTH_DES_MAC:
+		return "DES_MAC"
+	case AUTH_KPDK_MD5:
+		return "KPDK_MD5"
+	case AUTH_AES_XCBC_96:
+		return "AES_XCBC_96"
+	case AUTH_HMAC_MD5_128:
+		return "HMAC_MD5_128"
+	case AUTH_HMAC_SHA1_160:
+		return "HMAC_SHA1_160"
+	case AUTH_AES_CMAC_96:
+		return "AES_CMAC_96"
+	case AUTH_AES_128_GMAC:
+		return "AES_128_GMAC"
+	case AUTH_AES_192_GMAC:
+		return "AES_192_GMAC"
+	case AUTH_AES_256_GMAC:
+		return "AES_256_GMAC"
+	case AUTH_HMAC_SHA2_256_128:
+		return "HMAC_SHA2_256_128"
+	case AUTH_HMAC_SHA2_384_192:
+		return "HMAC_SHA2_384_192"
+	case AUTH_HMAC_SHA2_512_256:
+		return "HMAC_SHA2_512_256"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+func DHToString(id uint16) string {
+	switch AlgorithmType(id) {
+	case MODP_768_bit:
+		return "MODP_768"
+	case MODP_1024_bit:
+		return "MODP_1024"
+	case MODP_1536_bit:
+		return "MODP_1536"
+	case MODP_2048_bit:
+		return "MODP_2048"
+	case MODP_3072_bit:
+		return "MODP_3072"
+	case MODP_4096_bit:
+		return "MODP_4096"
+	case MODP_6144_bit:
+		return "MODP_6144"
+	case MODP_8192_bit:
+		return "MODP_8192"
+	default:
+		if id == 0 {
+			return "NONE"
+		}
+		return "UNKNOWN"
+	}
+}

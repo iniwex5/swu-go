@@ -62,19 +62,11 @@ func (s *Session) buildIKESAInitPacket() ([]byte, error) {
 		}
 	}
 
-	propCBC := ikev2.NewProposal(1, ikev2.ProtoIKE, nil)
-	propCBC.AddTransformWithKeyLen(ikev2.TransformTypeEncr, ikev2.ENCR_AES_CBC, 128)
-	propCBC.AddTransform(ikev2.TransformTypeInteg, ikev2.AUTH_HMAC_SHA2_256_128, 0)
-	propCBC.AddTransform(ikev2.TransformTypePRF, ikev2.PRF_HMAC_SHA2_256, 0)
-	propCBC.AddTransform(ikev2.TransformTypeDH, ikev2.MODP_2048_bit, 0)
-
-	propGCM := ikev2.NewProposal(2, ikev2.ProtoIKE, nil)
-	propGCM.AddTransformWithKeyLen(ikev2.TransformTypeEncr, ikev2.ENCR_AES_GCM_16, 128)
-	propGCM.AddTransform(ikev2.TransformTypePRF, ikev2.PRF_HMAC_SHA2_256, 0)
-	propGCM.AddTransform(ikev2.TransformTypeDH, ikev2.MODP_2048_bit, 0)
+	// 使用高兼容性的工厂方法生成 Proposal
+	proposals := ikev2.CreateMultiProposalIKE(nil)
 
 	saPayload := &ikev2.EncryptedPayloadSA{
-		Proposals: []*ikev2.Proposal{propCBC, propGCM},
+		Proposals: proposals,
 	}
 
 	kePayload := &ikev2.EncryptedPayloadKE{
@@ -301,7 +293,7 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 	var prfID uint16
 	var encrID uint16
 	var integID uint16
-	// var dhID uint16
+	var dhID uint16
 
 	for _, t := range selProp.Transforms {
 		switch t.Type {
@@ -312,9 +304,16 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 		case ikev2.TransformTypePRF:
 			prfID = uint16(t.ID)
 		case ikev2.TransformTypeDH:
-			// dhID = uint16(t.ID)
+			dhID = uint16(t.ID)
 		}
 	}
+
+	s.Logger.Debug("ePDG_SA_INIT: IKE SA 算法协商成功",
+		logger.String("encr", ikev2.EncrToString(encrID)),
+		logger.String("integ", ikev2.IntegToString(integID)),
+		logger.String("prf", ikev2.PRFToString(prfID)),
+		logger.String("dh", ikev2.DHToString(dhID)),
+	)
 
 	// 设置加密实例
 	s.PRFAlg, err = crypto.GetPRF(prfID)

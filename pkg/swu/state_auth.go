@@ -68,23 +68,13 @@ func (s *Session) buildIKEAuthInitPayloads() ([]ikev2.Payload, error) {
 		binary.BigEndian.PutUint32(spiBytes, s.childSPI)
 	}
 
-	propCBC := ikev2.NewProposal(1, ikev2.ProtoESP, spiBytes)
-	propCBC.AddTransformWithKeyLen(ikev2.TransformTypeEncr, ikev2.ENCR_AES_CBC, 128)
-	propCBC.AddTransform(ikev2.TransformTypeInteg, ikev2.AUTH_HMAC_SHA2_256_128, 0)
-	if s.cfg.EnableESN {
-		propCBC.AddTransform(ikev2.TransformTypeESN, 1, 0) // ESN
-	}
-	propCBC.AddTransform(ikev2.TransformTypeESN, 0, 0) // NO_ESN (fallback)
+	// 利用工厂方法生成覆盖高、中、低兼容性以及 ESN 处理的 Proposal 支持列表
+	proposals := ikev2.CreateMultiProposalESP(spiBytes)
 
-	propGCM := ikev2.NewProposal(2, ikev2.ProtoESP, spiBytes)
-	propGCM.AddTransformWithKeyLen(ikev2.TransformTypeEncr, ikev2.ENCR_AES_GCM_16, 128)
-	if s.cfg.EnableESN {
-		propGCM.AddTransform(ikev2.TransformTypeESN, 1, 0) // ESN
-	}
-	propGCM.AddTransform(ikev2.TransformTypeESN, 0, 0) // NO_ESN (fallback)
-
+	// 如果用户级配置指定了只发开启 ESN，则后续可在此二次过滤
+	// 但默认状态我们发送大而全的列表
 	saPayload := &ikev2.EncryptedPayloadSA{
-		Proposals: []*ikev2.Proposal{propCBC, propGCM},
+		Proposals: proposals,
 	}
 
 	// 3. TSi / TSr (0.0.0.0/0, ::/0)
@@ -936,6 +926,12 @@ func (s *Session) handleIKEAuthFinalResp(data []byte) error {
 	if encrID == 0 {
 		return errors.New("IKE_AUTH 最终响应缺少加密算法选择")
 	}
+
+	s.Logger.Info("ePDG_SA_AUTH: IPsec ESP (Child SA) 算法协商成功",
+		logger.String("encr", ikev2.EncrToString(encrID)),
+		logger.String("integ", ikev2.IntegToString(integID)),
+		logger.Bool("esn", s.childESN),
+	)
 
 	childEnc, err := crypto.GetEncrypterWithKeyLen(encrID, encrKeyLenBits)
 	if err != nil {
