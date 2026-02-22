@@ -50,7 +50,7 @@ func (s *Session) performSessionResumption() error {
 	s.msgBuffer = reqData
 
 	// 异步发送并阻塞等待 Ticket 回应
-	compCh := s.taskMgr.EnqueueRequest(0, ikev2.IKE_SESSION_RESUME, nil, reqData)
+	compCh := s.taskMgr.EnqueueRequest(0, ikev2.IKE_SESSION_RESUME, nil, [][]byte{reqData})
 	var respData []byte
 	var ok bool
 	select {

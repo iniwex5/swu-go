@@ -249,6 +249,27 @@ func (x *XFRMManager) FlushByIP(ip net.IP) {
 	}
 }
 
+// GetSALastUsed 查询指定 SPI 的内核 XFRM State，返回其最后被使用的时间戳。
+// 用于辅助重传或 DPD 等保活机制中的流量静默判定，如果未查询到或者从未启用则返回 0 时间。
+func (x *XFRMManager) GetSALastUsed(spi uint32, src, dst net.IP, proto netlink.Proto) (uint64, error) {
+	state := &netlink.XfrmState{
+		Src:   src,
+		Dst:   dst,
+		Proto: proto,
+		Spi:   int(spi),
+	}
+
+	s, err := netlink.XfrmStateGet(state)
+	if err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("读取 XFRM SA (spi=0x%x) 状态失败: %v", spi, err)
+	}
+
+	return s.Statistics.UseTime, nil
+}
+
 // AddSP 添加 XFRM Security Policy
 func (x *XFRMManager) AddSP(cfg XFRMSPConfig) error {
 	policy := &netlink.XfrmPolicy{
@@ -385,7 +406,7 @@ func (x *XFRMManager) buildXfrmState(cfg XFRMSAConfig) *netlink.XfrmState {
 	if cfg.ReplayWindow > 0 {
 		state.ReplayWindow = cfg.ReplayWindow
 	} else {
-		state.ReplayWindow = 32 // Default
+		state.ReplayWindow = 128 // Default (已从默认 32 拉升至抗乱序更强的 128)
 	}
 
 	// SA 方向标记（Linux 6.x+）

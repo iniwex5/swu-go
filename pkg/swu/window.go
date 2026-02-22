@@ -34,10 +34,10 @@ func DefaultRetryConfig() *RetryConfig {
 
 // OutgoingMessage 承载发送队列中的单一请求包状态，对应一笔完整的事务交互
 type OutgoingMessage struct {
-	MsgID      uint32
-	Payloads   []ikev2.Payload
-	Exchange   ikev2.ExchangeType
-	PacketData []byte // 已经构建和加密好的数据（多次重传可直接投递）
+	MsgID    uint32
+	Payloads []ikev2.Payload
+	Exchange ikev2.ExchangeType
+	Packets  [][]byte // 已经构建和加密好的数据（多次重传可直接投递）
 
 	// 重试上下文，与 strongSwan 退避算法对齐
 	RetryCount  int
@@ -62,10 +62,10 @@ type TaskManager struct {
 	mu       sync.Mutex
 	wakeupCh chan struct{} // 用于有新包入列时唤醒内部守护循环
 
-	sendFunc func([]byte) error // 回拨底层的发包接口
+	sendFunc func([][]byte) error // 回拨底层的发包接口
 }
 
-func NewTaskManager(ctx context.Context, config *RetryConfig, winSize int, sendFunc func([]byte) error) *TaskManager {
+func NewTaskManager(ctx context.Context, config *RetryConfig, winSize int, sendFunc func([][]byte) error) *TaskManager {
 	if config == nil {
 		config = DefaultRetryConfig()
 	}
@@ -95,13 +95,13 @@ func (tm *TaskManager) Stop() {
 	tm.cancel()
 }
 
-// EnqueueRequest 将构筑好的包掷入调度器，返回接收通道
-func (tm *TaskManager) EnqueueRequest(msgID uint32, exchange ikev2.ExchangeType, payloads []ikev2.Payload, packet []byte) <-chan []byte {
+// EnqueueRequest 将构筑好的包（可能是单包或者是多个 IKE 分片包）掷入调度器，返回接收通道
+func (tm *TaskManager) EnqueueRequest(msgID uint32, exchange ikev2.ExchangeType, payloads []ikev2.Payload, packets [][]byte) <-chan []byte {
 	outMsg := &OutgoingMessage{
 		MsgID:        msgID,
 		Payloads:     payloads,
 		Exchange:     exchange,
-		PacketData:   packet,
+		Packets:      packets,
 		MaxRetries:   tm.config.MaxRetries,
 		NextTimeout:  tm.config.InitialTimeout,
 		CompletionCh: make(chan []byte, 1),
@@ -129,7 +129,7 @@ func (tm *TaskManager) activateMessage(msg *OutgoingMessage) {
 
 	// 首次推报
 	if tm.sendFunc != nil {
-		_ = tm.sendFunc(msg.PacketData)
+		_ = tm.sendFunc(msg.Packets)
 	}
 	// 触发更新轮询
 	select {
@@ -229,7 +229,7 @@ func (tm *TaskManager) checkTimeouts() {
 					logger.Duration("nextDeadline", msg.NextTimeout))
 
 				if tm.sendFunc != nil {
-					_ = tm.sendFunc(msg.PacketData)
+					_ = tm.sendFunc(msg.Packets)
 				}
 			}
 		}

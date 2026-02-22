@@ -40,7 +40,7 @@ func (s *Session) ikeDispatchLoop() {
 				return
 			}
 
-			// 更新入站时间戳（对齐 strongSwan stats[STAT_INBOUND]）
+			// 更新入站时间戳
 			s.lastInboundTime = time.Now()
 
 			hdr, err := ikev2.DecodeHeader(data)
@@ -69,6 +69,29 @@ func (s *Session) ikeDispatchLoop() {
 					}
 				}
 				continue
+			}
+
+			// DPD 秒回短路：不排队，立即调用密码引擎和 Socket 返回 ePDG 存活证明
+			if hdr.ExchangeType == ikev2.INFORMATIONAL {
+				if hdr.NextPayload == ikev2.SK && (hdr.Flags&ikev2.FlagInitiator != 0) && hdr.Length == 76 { // AES/CBC+SHA256 等通常无额外载荷时的定长，或者解密探查
+					// 为了 100% 安全，解密但不排队
+					go func(msgID uint32, raw []byte) {
+						s.Logger.Debug("涉嫌收到高优 DPD 探针，开启快速通道拦截检查", logger.Uint32("msgID", msgID))
+						_, payloads, err := s.decryptAndParse(raw)
+						if err == nil && len(payloads) == 0 {
+							// 确认是空的 DPD 探针！秒回
+							s.Logger.Info("收到 ePDG DPD 死亡探测信号，已进入特权通道优先确认存活", logger.Uint32("msgID", msgID))
+							_ = s.sendEncryptedResponseWithMsgID(nil, ikev2.INFORMATIONAL, msgID)
+							return
+						}
+						// 假如误判了有其他载荷，再送回原通道慢处理
+						if err == nil {
+							s.Logger.Debug("包含载荷，退回普通队列", logger.Int(" payloadCount", len(payloads)))
+							s.handleIncomingInformational(raw)
+						}
+					}(hdr.MessageID, data)
+					continue
+				}
 			}
 
 			s.ikeMu.Lock()

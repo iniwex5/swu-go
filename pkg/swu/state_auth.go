@@ -22,11 +22,17 @@ func (s *Session) buildIKEAuthInitPayloads() ([]ikev2.Payload, error) {
 	// 载荷: IDi, SA, TS, TS, N(EAP_ONLY)
 
 	// 1. IDi
-	imsi, err := s.cfg.SIM.GetIMSI()
-	if err != nil {
-		return nil, err
+	var nai string
+	if s.cfg.FastReauthID != "" {
+		nai = s.cfg.FastReauthID
+		s.Logger.Info("IKE_AUTH: 探测到缓存的 FastReauthID 假名，替代 IMSI 暴露身份", logger.String("nai", nai))
+	} else {
+		imsi, err := s.cfg.SIM.GetIMSI()
+		if err != nil {
+			return nil, err
+		}
+		nai = buildNAI(imsi, s.cfg)
 	}
-	nai := buildNAI(imsi, s.cfg)
 	idPayload := &ikev2.EncryptedPayloadID{
 		IDType:      ikev2.ID_RFC822_ADDR,
 		IDData:      []byte(nai),
@@ -193,6 +199,13 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		atAutn, ok2 := attrs[eap.AT_AUTN]
 		atMac, ok3 := attrs[eap.AT_MAC]
 
+		// DEBUG: Print all received attributes
+		var keys []uint8
+		for k := range attrs {
+			keys = append(keys, k)
+		}
+		s.Logger.Debug("Received EAP-AKA Challenge attributes", logger.Any("keys", keys))
+
 		if !ok1 || !ok2 {
 			return nil, errors.New("AKA 挑战中缺少 RAND 或 AUTN")
 		}
@@ -224,7 +237,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		imsi, _ := s.cfg.SIM.GetIMSI()
 		identity := []byte(buildNAI(imsi, s.cfg))
 
-		derive := func(order int) (kAut []byte, msk []byte, err error) {
+		derive := func(order int) (kAut []byte, msk []byte, mk []byte, err error) {
 			h := sha1.New()
 			h.Write(identity)
 			if order == 0 {
@@ -234,10 +247,10 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 				h.Write(ck)
 				h.Write(ik)
 			}
-			mk := h.Sum(nil)
+			mk = h.Sum(nil)
 
 			keyMat := crypto.NewFIPS1862PRFSHA1(mk).Bytes(nil, 16+16+64)
-			return keyMat[16:32], keyMat[32:96], nil
+			return keyMat[16:32], keyMat[32:96], mk, nil
 		}
 
 		tryOrders := []int{0, 1}
@@ -250,7 +263,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 			return nil, err
 		}
 		for _, order := range tryOrders {
-			kAutTry, mskTry, err := derive(order)
+			kAutTry, mskTry, _, err := derive(order)
 			if err != nil {
 				return nil, err
 			}
@@ -275,6 +288,8 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 
 		s.MSK = msk
 
+		// Removed duplicate AT_NEXT_REAUTH_ID check here to avoid buggy string(Value) conversion.
+
 		// 构造响应
 		// 属性: AT_RES, AT_MAC
 
@@ -286,6 +301,10 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		resValue := append(resBits, res...)
 		atRes := &eap.Attribute{Type: eap.AT_RES, Value: resValue}
 		respAttrs = append(respAttrs, atRes.Encode()...)
+
+		// 增加 AT_ANY_ID_REQ 主动向服务端恳求下发 Fast Re-auth 假名
+		atAnyIdReq := &eap.Attribute{Type: eap.AT_ANY_ID_REQ, Value: make([]byte, 2)} // value is filled to 0 so size is 4 bytes total
+		respAttrs = append(respAttrs, atAnyIdReq.Encode()...)
 
 		// AT_MAC
 		// 初始值为 16 字节零
@@ -354,6 +373,9 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 				if s.cfg.OnFastReauthUpdate != nil {
 					s.cfg.OnFastReauthUpdate(reauthID, mk, kAut, kEncr)
 				}
+			} else {
+				// Failed to parse Actual Length or corrupted Value
+				s.Logger.Warn("解析 AT_NEXT_REAUTH_ID 失败：长度校验不通过", logger.Int("valueLen", len(atNextReauthID.Value)), logger.Int("actualLen", actualLen))
 			}
 		}
 
@@ -374,6 +396,12 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		atMac, ok3 := attrs[eap.AT_MAC]
 		atKdfInput, ok4 := attrs[eap.AT_KDF_INPUT]
 		atKdf, ok5 := attrs[eap.AT_KDF]
+
+		var keys []uint8
+		for k := range attrs {
+			keys = append(keys, k)
+		}
+		s.Logger.Debug("Received EAP-AKA' Challenge attributes", logger.Any("keys", keys))
 
 		if !ok1 || !ok2 {
 			return nil, errors.New("AKA' Challenge 缺少 RAND 或 AUTN")
@@ -481,6 +509,21 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 
 		s.MSK = msk
 
+		// RFC 4187 Fast Reauth: 捕获 AT_NEXT_REAUTH_ID (5G AKA')
+		if atNextReauth, ok := attrs[eap.AT_NEXT_REAUTH_ID]; ok && s.fastReauthCtx != nil {
+			if len(atNextReauth.Value) > 2 {
+				actualLen := int(atNextReauth.Value[0])<<8 | int(atNextReauth.Value[1])
+				if actualLen > 0 && actualLen+2 <= len(atNextReauth.Value) {
+					nextReauthID := string(atNextReauth.Value[2 : 2+actualLen])
+					s.Logger.Info("捕获到来自 5G ePDG 的 Fast Re-auth 假名标识，激活免流授权通道", logger.String("NextReauthID", nextReauthID))
+					s.fastReauthCtx.SaveReauthData(nextReauthID, mk, nil, kAut)
+					if s.cfg.OnFastReauthUpdate != nil {
+						s.cfg.OnFastReauthUpdate(nextReauthID, mk, kAut, nil)
+					}
+				}
+			}
+		}
+
 		// 构造 AKA' 响应
 		respAttrs := []byte{}
 
@@ -490,6 +533,10 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		resValue := append(resBits, res...)
 		atRes := &eap.Attribute{Type: eap.AT_RES, Value: resValue}
 		respAttrs = append(respAttrs, atRes.Encode()...)
+
+		// 增加 AT_ANY_ID_REQ 主动向 5G ePDG 恳求下发 Fast Re-auth 假名
+		atAnyIdReq := &eap.Attribute{Type: eap.AT_ANY_ID_REQ, Value: make([]byte, 2)}
+		respAttrs = append(respAttrs, atAnyIdReq.Encode()...)
 
 		// AT_MAC (占位 16 字节零)
 		respMacAttr := &eap.Attribute{Type: eap.AT_MAC, Value: make([]byte, 18)}

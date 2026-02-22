@@ -289,7 +289,14 @@ func (s *Session) connectOnce() error {
 	defer s.socket.Stop()
 
 	// 把 socket 的发包句柄挂载到滑动窗口调度器
-	s.taskMgr.sendFunc = s.socket.SendIKE
+	s.taskMgr.sendFunc = func(pkts [][]byte) error {
+		for _, pkt := range pkts {
+			if err := s.socket.SendIKE(pkt); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 
 	s.startNetEventMonitor()
 
@@ -339,7 +346,7 @@ func (s *Session) connectOnce() error {
 			}
 
 			// 异步推送，并挂起等待窗口的回执通道
-			compCh := s.taskMgr.EnqueueRequest(0, ikev2.IKE_SA_INIT, nil, reqData)
+			compCh := s.taskMgr.EnqueueRequest(0, ikev2.IKE_SA_INIT, nil, [][]byte{reqData})
 
 			var respData []byte
 			var ok bool
@@ -725,6 +732,21 @@ func (s *Session) startNATKeepalive(interval time.Duration) {
 	go func() {
 		for {
 			diff := time.Since(s.lastOutboundTime)
+
+			// 智能流量感知：去内核中捞一把最新的交互状态
+			if s.xfrmMgr != nil {
+				if outsa := s.ChildSAOut; outsa != nil {
+					if useTime, err := s.xfrmMgr.GetSALastUsed(outsa.SPI, s.xfrmLocalIP, s.xfrmRemoteIP, netlink.XFRM_PROTO_ESP); err == nil && useTime > 0 {
+						// useTime 返回的是最近一次使用的 Unix Timestamp
+						lastUsedNetlink := time.Unix(int64(useTime), 0)
+						if lastUsedNetlink.After(s.lastOutboundTime) {
+							// 内核反馈：在那之后确实有跑过真实的业务包，无需发送无聊的探测单！
+							s.lastOutboundTime = lastUsedNetlink
+							diff = time.Since(s.lastOutboundTime)
+						}
+					}
+				}
+			}
 
 			if keepaliveDPDMargin > 0 && diff > interval+keepaliveDPDMargin {
 				// strongSwan: 超出 keepalive + dpd_margin → 改发 DPD（而非 keepalive）
@@ -1891,47 +1913,46 @@ func (s *Session) sendEncryptedWithRetry(payloads []ikev2.Payload, exchangeType 
 		return nil, errors.New("任务调度器未初始化")
 	}
 
+	var packets [][]byte
+	var err error
+
 	// IKE Fragmentation (RFC 7383): 如果消息过大且对端支持分片，则分片发送
 	if s.shouldFragment(payloads) {
-		packets, err := s.fragmentMessage(payloads, exchangeType)
+		packets, err = s.fragmentMessage(payloads, exchangeType)
 		if err != nil {
 			return nil, fmt.Errorf("IKE 分片失败: %v", err)
 		}
-		if len(packets) > 0 {
-			// 分片模式: 发送所有分片，等待最后一个分片的响应
-			// 所有分片共享同一个 Message ID
-			// 获取由上方的 NextSequenceNumber 取出但在 encryptWrapper 里被自增过的尾号
-			msgID := s.SequenceNumber.Load() - 1
-			for _, pkt := range packets {
-				if err := s.socket.SendIKE(pkt); err != nil {
-					return nil, fmt.Errorf("发送 IKE 分片失败: %v", err)
-				}
-			}
-			// 等待响应
-			return s.receiveIKEResponseWithTimeout(exchangeType, msgID, 10*time.Second)
-		}
 	}
 
-	// 正常（非分片）发送
-	packetData, err := s.encryptAndWrap(payloads, exchangeType, false)
-	if err != nil {
-		return nil, err
+	// 正常（非分片）发送或者分片返回空时退阶保护
+	if len(packets) == 0 {
+		packetData, err := s.encryptAndWrap(payloads, exchangeType, false)
+		if err != nil {
+			return nil, err
+		}
+		packets = [][]byte{packetData}
 	}
+
+	// 所有分片共享同一个 Message ID
+	// 获取由上方的 NextSequenceNumber 取出但在 encryptWrapper 里被自增过的尾号
 	msgID := s.SequenceNumber.Load() - 1
-	s.lastEncryptedMsg = packetData
+
+	// 为后续重发准备调试状态
+	s.lastEncryptedMsg = packets[0]
 	s.lastEncryptedMsgID = msgID
-	logger.Debug("发送加密 IKE 消息",
+	logger.Debug("发送加密 IKE 消息（已送入并发重传窗口）",
 		logger.Uint64("spii", s.SPIi),
 		logger.Uint64("spir", s.SPIr),
 		logger.Uint32("msgid", msgID),
 		logger.Int("exchange", int(exchangeType)),
+		logger.Int("fragments", len(packets)),
 	)
 
 	// 更新出站时间戳（与 strongSwan stats[STAT_OUTBOUND] 一致）
 	s.lastOutboundTime = time.Now()
 
-	// 异步推送进滑动窗口队列
-	compCh := s.taskMgr.EnqueueRequest(msgID, exchangeType, payloads, packetData)
+	// 统一异步推送进滑动窗口队列（无论被切分成了多少包，TaskManager 的 Retry 会连带全部发射）
+	compCh := s.taskMgr.EnqueueRequest(msgID, exchangeType, payloads, packets)
 
 	// 这里仍然需要向外层提供同步的 `[]byte` 返回语义，但是不会在重试循环里死耗
 	select {
