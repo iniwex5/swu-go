@@ -1022,7 +1022,7 @@ func (s *Session) setupDataPlane() error {
 		}
 		mtu := s.cfg.TUNMTU
 		if mtu == 0 {
-			mtu = 1200
+			mtu = 1500
 		}
 		if mtu > 0 && s.cpConfig != nil && len(s.cpConfig.IPv6Addresses) > 0 && mtu < 1280 {
 			mtu = 1280
@@ -1041,7 +1041,7 @@ func (s *Session) setupDataPlane() error {
 		}
 		mtu := s.cfg.TUNMTU
 		if mtu == 0 {
-			mtu = 1200
+			mtu = 1500
 		}
 		if mtu > 0 && s.cpConfig != nil && len(s.cpConfig.IPv6Addresses) > 0 && mtu < 1280 {
 			mtu = 1280
@@ -1360,7 +1360,7 @@ func (s *Session) setupXFRMDataPlane() error {
 	}
 	mtu := s.cfg.TUNMTU
 	if mtu == 0 {
-		mtu = 1280 // XFRMI 可以用更大的 MTU (内核处理开销更小)
+		mtu = 1500 // XFRMI 可以用更大的 MTU (内核处理开销更小)
 	}
 	if mtu > 0 && s.cpConfig != nil && len(s.cpConfig.IPv6Addresses) > 0 && mtu < 1280 {
 		mtu = 1280
