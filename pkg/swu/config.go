@@ -28,7 +28,7 @@ type Config struct {
 	ReauthInterval int
 
 	TUNName string // TUN 设备名 (默认自动分配)
-	TUNMTU  int    // TUN MTU，0 表示使用默认值（当前默认 1500）
+	TUNMTU  int    // TUN MTU，0 表示使用默认值（默认 1358，已预留约 142B 的 ESP-in-UDP 封装开销）
 
 	// XFRM SA 抗重放窗口大小（0 = 使用默认值 32）
 	// 高延迟/乱序网络建议设为 128 或 256

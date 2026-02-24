@@ -1022,7 +1022,7 @@ func (s *Session) setupDataPlane() error {
 		}
 		mtu := s.cfg.TUNMTU
 		if mtu == 0 {
-			mtu = 1500
+			mtu = 1358 // 必须留出 ESP-in-UDP 封装开销（约 106 B），防止 IP 分片导致 SIP 信令丢包
 		}
 		if mtu > 0 && s.cpConfig != nil && len(s.cpConfig.IPv6Addresses) > 0 && mtu < 1280 {
 			mtu = 1280
@@ -1041,7 +1041,7 @@ func (s *Session) setupDataPlane() error {
 		}
 		mtu := s.cfg.TUNMTU
 		if mtu == 0 {
-			mtu = 1500
+			mtu = 1358 // 必须留出 ESP-in-UDP 封装开销（约 106 B），防止 IP 分片导致 SIP 信令丢包
 		}
 		if mtu > 0 && s.cpConfig != nil && len(s.cpConfig.IPv6Addresses) > 0 && mtu < 1280 {
 			mtu = 1280
@@ -1360,7 +1360,22 @@ func (s *Session) setupXFRMDataPlane() error {
 	}
 	mtu := s.cfg.TUNMTU
 	if mtu == 0 {
-		mtu = 1500 // XFRMI 可以用更大的 MTU (内核处理开销更小)
+		// XFRM 接口（内层虚拟接口）的 MTU 必须减去 IPsec/UDP 封装开销，
+		// 否则内层数据包加上 ESP-in-UDP 封装头后会超出底层网络的 MTU（通常 1500），
+		// 触发 IP 分片。IP 分片包极易被 NAT 路由器或运营商设备丢弃，
+		// 导致 SIP INVITE 等大型信令包（含 SDP 体）被丢弃，进而表现为"来电经常接不到"。
+		//
+		// 典型开销（IPv4 底层 + ESP-in-UDP + 内层 IPv6）：
+		//   底层 IPv4 头  20 B
+		//   UDP（NAT-T）   8 B
+		//   ESP Header     8 B
+		//   IV（AES-GCM） 12 B
+		//   ESP Trailer    ≈2 B
+		//   ICV（GCM-16） 16 B
+		//   内层 IPv6 头  40 B
+		//   ≈ 106 B 开销
+		// 1500 - 106 - 36（对齐余量）= 1358，与运营商 VoLTE 设备通用值一致。
+		mtu = 1358
 	}
 	if mtu > 0 && s.cpConfig != nil && len(s.cpConfig.IPv6Addresses) > 0 && mtu < 1280 {
 		mtu = 1280
