@@ -16,6 +16,13 @@ func (s *Session) sendDPD() error {
 	return err
 }
 
+// DPDProbe 提供给上层（如 SIP）主动发起 DPD 探测的接口。
+// 它强制触发一个 DPD 报文并由底层滑动窗口负责重传，如果底层在重传耗尽后仍无响应，
+// 底层会自动触发 OnSessionDown 并终止 Session，同时这里的返回 err 也仅表示投递失败。
+func (s *Session) DPDProbe() error {
+	return s.sendDPD()
+}
+
 // sendDeleteIKE 发送 IKE SA 删除通知
 func (s *Session) sendDeleteIKE() error {
 	s.Logger.Debug("发送 IKE SA Delete 通知")
