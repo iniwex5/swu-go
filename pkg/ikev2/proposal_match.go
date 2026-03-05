@@ -13,7 +13,7 @@ type ProposalMatcher struct {
 	SupportedDH []AlgorithmType
 }
 
-// DefaultProposalMatcher 返回默认的算法优先级 (类似于 strongSwan default proposals)
+// DefaultProposalMatcher 返回默认的算法优先级
 func DefaultProposalMatcher() *ProposalMatcher {
 	return &ProposalMatcher{
 		SupportedEncr: []AlgorithmType{

@@ -64,8 +64,7 @@ func (s *Session) sendDeleteChildSA(spis []uint32) error {
 	return s.socket.SendIKE(pkt)
 }
 
-// StartDPD 启动 DPD 后台任务（对齐 strongSwan ike_sa.c:send_dpd）
-// strongSwan 策略：
+// StartDPD 启动 DPD 后台任务
 //  1. 检查 lastInboundTime（入站时间差），有流量则跳过 DPD 请求
 //  2. DPD 发送由 sendEncryptedWithRetry 负责超时重传（5次/~165s）
 //  3. 重传耗尽 → 判定对端不可达，触发隧道重建
@@ -84,7 +83,7 @@ func (s *Session) StartDPD(interval time.Duration) {
 			case <-s.ctx.Done():
 				return
 			case <-ticker.C:
-				// strongSwan 策略：检查入站时间差，有流量则跳过 DPD
+				// 检查入站时间差，有流量则跳过 DPD
 				diff := time.Since(s.lastInboundTime)
 				if diff < interval {
 					// 入站间隔内有流量，对端存活，无需 DPD

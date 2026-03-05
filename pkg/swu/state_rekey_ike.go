@@ -162,7 +162,6 @@ func (s *Session) handleRekeyIKESAResp(
 	}
 
 	// 用旧密钥发送 INFORMATIONAL DELETE 通知 ePDG 旧 IKE SA 废弃
-	// 参考 strongSwan ike_rekey.c:727 — DELETE 必须在旧 SA 上发送，且需等待响应
 	s.Logger.Debug("发送旧 IKE SA DELETE 通知（使用旧密钥）",
 		logger.Uint64("oldSPIi", oldSPIi),
 		logger.Uint64("oldSPIr", oldSPIr))
@@ -183,7 +182,7 @@ func (s *Session) handleRekeyIKESAResp(
 	s.SPIr = newSPIr
 	s.Keys = newKeys
 	s.SequenceNumber.Store(0) // 新 IKE SA 的 MsgID 从 0 开始
-	s.DH = newDH         // 更新 DH 状态
+	s.DH = newDH              // 更新 DH 状态
 
 	s.Logger.Info("IKE SA Rekey 成功",
 		logger.Uint64("oldSPIi", oldSPIi),

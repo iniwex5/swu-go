@@ -210,7 +210,7 @@ func (s *Session) handleIncomingInformational(data []byte) error {
 			if notify.NotifyType == ikev2.UPDATE_SA_ADDRESSES {
 				s.Logger.Info("收到 ePDG 发起的 UPDATE_SA_ADDRESSES (RFC 4555)")
 				if s.mobikeSupported {
-					// 用报文实际来源更新内核 SA/SP (参考 strongSwan ike_mobike.c:445-468)
+					// 用报文实际来源更新内核 SA/SP
 					if s.xfrmMgr != nil {
 						if sm, ok := s.socket.(*ipsec.SocketManager); ok {
 							newRemoteIP := sm.RemoteIP()
@@ -286,7 +286,7 @@ func (s *Session) handleIncomingInformational(data []byte) error {
 			continue
 		}
 
-		// 收集需要回复的本端出站 SPI（对齐 strongSwan delete_child_sa 行为）
+		// 收集需要回复的本端出站 SPI
 		var deletedLocalSPIs []uint32
 		for i := 0; i+4 <= len(del.SPIs); i += 4 {
 			spi := binary.BigEndian.Uint32(del.SPIs[i : i+4])
@@ -331,7 +331,6 @@ func (s *Session) handleIncomingInformational(data []byte) error {
 func (s *Session) handleIncomingCreateChildSAParsed(msgID uint32, payloads []ikev2.Payload) error {
 	// Rekey Collision 检测：如果本端正在主动 Rekey（持有 rekeyMu），
 	// 则回复 TEMPORARY_FAILURE 让 ePDG 稍后重试
-	// 参考 strongSwan child_rekey.c 碰撞处理
 	if !s.rekeyMu.TryLock() {
 		s.Logger.Warn("检测到 Rekey 碰撞（本端正在 Rekey），响应 TEMPORARY_FAILURE",
 			logger.Uint32("msgID", msgID))

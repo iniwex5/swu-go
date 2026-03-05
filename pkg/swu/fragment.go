@@ -23,7 +23,6 @@ const (
 	ikeOverhead        = 28 + 8 + 20 + 8 // IKE Header + SKF Header + IP + UDP
 	maxFragments       = 255             // RFC 7383: 最多 255 个分片
 	// 最大重组后包大小 (防止内存耗尽攻击)
-	// 参考 strongSwan: frag->max_packet 默认 64KB
 	maxFragmentedPacket = 64 * 1024
 )
 
@@ -47,7 +46,6 @@ func newFragmentBuffer() *fragmentBuffer {
 }
 
 // addFragment 添加一个分片，返回是否已收齐所有分片
-// 参考 strongSwan message.c:add_fragment() 的安全检查:
 //   - 重复分片检测 (忽略已有分片)
 //   - 最大包大小限制 (防止 DoS)
 //   - 总数不一致时重置缓存
@@ -64,7 +62,6 @@ func (fb *fragmentBuffer) addFragment(msgID uint32, fragNum, totalFrags uint16, 
 		fb.frags[msgID] = fs
 	}
 
-	// strongSwan: 如果总数变大，重置缓存 (可能是对端重发了不同分片)
 	if totalFrags > fs.total {
 		fs.total = totalFrags
 		fs.received = make(map[uint16][]byte)
@@ -73,12 +70,10 @@ func (fb *fragmentBuffer) addFragment(msgID uint32, fragNum, totalFrags uint16, 
 		return false, fmt.Errorf("分片总数不一致: 期望 %d, 收到 %d", fs.total, totalFrags)
 	}
 
-	// strongSwan: 忽略重复分片
 	if _, exists := fs.received[fragNum]; exists {
 		return false, nil
 	}
 
-	// strongSwan: 检查最大包大小 (防止内存耗尽攻击)
 	fs.totalLen += len(plaintext)
 	if fs.totalLen > maxFragmentedPacket {
 		delete(fb.frags, msgID)

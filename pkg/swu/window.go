@@ -22,12 +22,11 @@ type RetryConfig struct {
 }
 
 // DefaultRetryConfig 默认重传配置
-// 对齐 strongSwan 默认值 (retransmit_timeout=4s, retransmit_base=1.8, retransmit_tries=5)
 func DefaultRetryConfig() *RetryConfig {
 	return &RetryConfig{
 		MaxRetries:     5,
 		InitialTimeout: 4 * time.Second,
-		MaxTimeout:     0, // 0 表示无上限，与 strongSwan retransmit_limit=0 一致
+		MaxTimeout:     0, // 0 表示无上限
 		BackoffFactor:  1.8,
 	}
 }
@@ -39,7 +38,7 @@ type OutgoingMessage struct {
 	Exchange ikev2.ExchangeType
 	Packets  [][]byte // 已经构建和加密好的数据（多次重传可直接投递）
 
-	// 重试上下文，与 strongSwan 退避算法对齐
+	// 重试上下文
 	RetryCount  int
 	MaxRetries  int
 	NextTimeout time.Duration

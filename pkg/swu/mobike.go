@@ -16,7 +16,6 @@ import (
 const cookie2Size = 16
 
 // UpdateAddresses 执行 MOBIKE 地址更新 (RFC 4555)
-// 操作顺序参考 strongSwan ike_mobike.c:
 //  1. 先发送 UPDATE_SA_ADDRESSES + COOKIE2 + NAT_DETECTION
 //  2. 验证响应中的 COOKIE2
 //  3. 确认成功后才更新 Socket 和 XFRM

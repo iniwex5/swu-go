@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"net"
 	"time"
 
@@ -70,7 +71,7 @@ func (s *Session) buildIKESAInitPacket() ([]byte, error) {
 	}
 
 	kePayload := &ikev2.EncryptedPayloadKE{
-		DHGroup: ikev2.MODP_2048_bit,
+		DHGroup: ikev2.AlgorithmType(s.DH.Group), // 动态读取当前的 DH 组
 		KEData:  s.DH.PublicKeyBytes(),
 	}
 
@@ -220,7 +221,27 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 				} else {
 					return &RedirectError{NewAddr: addr}
 				}
+				continue
 			}
+
+			// INVALID_KE_PAYLOAD (RFC 7296 §2.6.1): NotifyData 含 2 字节期望 DH Group ID
+			if v.NotifyType == 17 { // INVALID_KE_PAYLOAD
+				if len(v.NotifyData) >= 2 {
+					preferredGroup := binary.BigEndian.Uint16(v.NotifyData[:2])
+					return &ErrInvalidKEGroup{PreferredGroup: preferredGroup}
+				}
+				return errors.New("服务器拒绝 DH 群组 (INVALID_KE_PAYLOAD), 并未指定期望群组")
+			}
+
+			// RFC 7296: NotifyType < 16384 为错误类通知，直接中断协商
+			if v.NotifyType < 16384 {
+				return fmt.Errorf("服务器在 SA_INIT 阶段拒绝：%s (code=%d)", notifyTypeToString(v.NotifyType), v.NotifyType)
+			}
+
+			// 未知状态类 Notify（信息类，>= 16384）
+			s.Logger.Debug("SA_INIT 收到状态类 Notify",
+				logger.Int("type", int(v.NotifyType)),
+				logger.Int("data_len", len(v.NotifyData)))
 		}
 	}
 
@@ -351,6 +372,46 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 
 	s.sendCookie = false
 	return nil
+}
+
+// ErrInvalidKEGroup 表示服务在 SA_INIT 阶段拒绝了我们的 DH Group
+// 并在 PreferredGroup 字段中携带期望的群组 ID
+type ErrInvalidKEGroup struct {
+	PreferredGroup uint16
+}
+
+func (e *ErrInvalidKEGroup) Error() string {
+	return fmt.Sprintf("服务器拒绝 DH Group，期望使用 Group %d", e.PreferredGroup)
+}
+
+// notifyTypeToString 将 IKEv2 错误类 Notify 类型转换为可读字符串
+func notifyTypeToString(t uint16) string {
+	switch t {
+	case ikev2.UNSUPPORTED_CRITICAL_PAYLOAD:
+		return "UNSUPPORTED_CRITICAL_PAYLOAD"
+	case ikev2.INVALID_IKE_SPI:
+		return "INVALID_IKE_SPI"
+	case ikev2.INVALID_MAJOR_VERSION:
+		return "INVALID_MAJOR_VERSION"
+	case ikev2.INVALID_SYNTAX:
+		return "INVALID_SYNTAX"
+	case ikev2.INVALID_MESSAGE_ID:
+		return "INVALID_MESSAGE_ID"
+	case ikev2.INVALID_SPI:
+		return "INVALID_SPI"
+	case ikev2.NO_PROPOSAL_CHOSEN:
+		return "NO_PROPOSAL_CHOSEN"
+	case 17:
+		return "INVALID_KE_PAYLOAD"
+	case ikev2.AUTHENTICATION_FAILED:
+		return "AUTHENTICATION_FAILED"
+	case ikev2.TEMPORARY_FAILURE:
+		return "TEMPORARY_FAILURE"
+	case ikev2.CHILD_SA_NOT_FOUND:
+		return "CHILD_SA_NOT_FOUND"
+	default:
+		return "UNKNOWN"
+	}
 }
 
 func ParseRedirectData(data []byte) (string, error) {

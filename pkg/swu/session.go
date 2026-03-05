@@ -363,6 +363,23 @@ func (s *Session) connectOnce() error {
 				if errors.Is(err, ErrCookieRequired) {
 					continue
 				}
+				// RFC 7296 §2.6.1: 服务器拒绝了我们的 DH Group，用期望的群组重建 DH 并重发
+				var keErr *ErrInvalidKEGroup
+				if errors.As(err, &keErr) {
+					s.Logger.Warn("服务器要求切换 DH Group, 重新发起 SA_INIT",
+						logger.Int("preferred_group", int(keErr.PreferredGroup)))
+					newDH, dhErr := crypto.NewDiffieHellman(keErr.PreferredGroup)
+					if dhErr != nil {
+						return fmt.Errorf("服务器期望的 DH Group %d 不支持: %v", keErr.PreferredGroup, dhErr)
+					}
+					if err := newDH.GenerateKey(); err != nil {
+						return fmt.Errorf("DH Group %d 生成密钥失败: %v", keErr.PreferredGroup, err)
+					}
+					s.DH = newDH
+					// 重置 Nonce 以便重新构建包
+					s.ni = nil
+					continue
+				}
 				return err
 			}
 			break
@@ -482,11 +499,6 @@ func (s *Session) connectOnce() error {
 	} // End of if !resumed block
 
 	s.Logger.Info("会话已建立", logger.Duration("handshake", time.Since(handshakeStart)))
-
-	// 4. 设置 IPSec 数据平面
-	// 强制启用 XFRMI 模式 (DEBUG FIX)
-	s.cfg.EnableDriver = true
-	s.cfg.DataplaneMode = "xfrmi"
 
 	if s.cfg.EnableDriver {
 		if s.cfg.DataplaneMode == "xfrmi" {
