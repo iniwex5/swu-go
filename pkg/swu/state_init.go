@@ -8,7 +8,6 @@ import (
 	"net"
 	"time"
 
-	//"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -135,9 +134,10 @@ func (s *Session) buildIKESAInitPacket() ([]byte, error) {
 		NotifyType: ikev2.IKEV2_FRAGMENTATION_SUPPORTED,
 	}
 
-	// 顺序: SA, KE, Nonce, FRAG, [COOKIE], NAT_SRC, NAT_DST
+	// 顺序: [COOKIE], SA, KE, Nonce, FRAG, NAT_SRC, NAT_DST
+	var payloads []ikev2.Payload
 
-	payloads := []ikev2.Payload{saPayload, kePayload, noncePayload, fragNotify}
+	// RFC 7296 §2.6: Cookie类型的通知有效负载必须是第一个有效负载
 	if s.sendCookie && len(s.cookie) > 0 {
 		payloads = append(payloads, &ikev2.EncryptedPayloadNotify{
 			ProtocolID: 0,
@@ -145,6 +145,8 @@ func (s *Session) buildIKESAInitPacket() ([]byte, error) {
 			NotifyData: s.cookie,
 		})
 	}
+
+	payloads = append(payloads, saPayload, kePayload, noncePayload, fragNotify)
 	payloads = append(payloads, natSrcPayload, natDstPayload)
 
 	packet := ikev2.NewIKEPacket()
@@ -313,6 +315,7 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 	selProp := saPayload.Proposals[0]
 	var prfID uint16
 	var encrID uint16
+	var encrKeyLenBits int
 	var integID uint16
 	var dhID uint16
 
@@ -320,6 +323,11 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 		switch t.Type {
 		case ikev2.TransformTypeEncr:
 			encrID = uint16(t.ID)
+			for _, a := range t.Attributes {
+				if a.Type == ikev2.AttributeKeyLength {
+					encrKeyLenBits = int(a.Val)
+				}
+			}
 		case ikev2.TransformTypeInteg:
 			integID = uint16(t.ID)
 		case ikev2.TransformTypePRF:
@@ -331,6 +339,7 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 
 	s.Logger.Debug("ePDG_SA_INIT: IKE SA 算法协商成功",
 		logger.String("encr", ikev2.EncrToString(encrID)),
+		logger.Int("encr_key_bits", encrKeyLenBits),
 		logger.String("integ", ikev2.IntegToString(integID)),
 		logger.String("prf", ikev2.PRFToString(prfID)),
 		logger.String("dh", ikev2.DHToString(dhID)),
@@ -342,7 +351,7 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 		return fmt.Errorf("选择了不支持的 PRF: %d", prfID)
 	}
 
-	s.EncAlg, err = crypto.GetEncrypter(encrID)
+	s.EncAlg, err = crypto.GetEncrypterWithKeyLen(encrID, encrKeyLenBits)
 	if err != nil {
 		return fmt.Errorf("选择了不支持的 Encr: %d", encrID)
 	}

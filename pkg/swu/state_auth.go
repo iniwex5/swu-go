@@ -123,23 +123,78 @@ func (s *Session) buildIKEAuthInitPayloads() ([]ikev2.Payload, error) {
 	s.Logger.Debug("IKE_AUTH 已注入 INITIAL_CONTACT，要求 ePDG 清理旧隧道残留")
 
 	payloads := []ikev2.Payload{idPayload, idrPayload, cpPayload, saPayload, tsPayloadI, tsPayloadR, notifyPayload, mobikePayload, ticketReqPayload, initialContactPayload}
-	if p, ok := s.cfg.SIM.(sim.IMEIProvider); ok {
-		if imei, err := p.GetIMEI(); err == nil && imei != "" {
-			data := append([]byte{0x01}, []byte(imei)...)
+	// 可选：注入 DEVICE_IDENTITY（伪造 IMEI）。
+	// 默认关闭，避免在严格风控网络上触发策略拒绝。
+	if s.cfg.EnableDeviceIdentitySpoof {
+		if imsi, err := s.cfg.SIM.GetIMSI(); err == nil && imsi != "" {
+			spoofedIMEI := spoofAppleIMEI(imsi)
+			s.Logger.Info("已启用 DEVICE_IDENTITY 伪装，向 IKE_AUTH 注入伪造 iPhone 设备标识", logger.String("spoofed_imei", spoofedIMEI))
+
+			tbcdIMEI := encodeTBCD(spoofedIMEI)
+			// 遵循 3GPP TS 24.302 规范：1字节Type(1=IMEI) + 1字节Length + TBCD 编码串
+			data := make([]byte, 2+len(tbcdIMEI))
+			data[0] = 0x01
+			data[1] = byte(len(tbcdIMEI))
+			copy(data[2:], tbcdIMEI)
+
 			payloads = append(payloads, &ikev2.EncryptedPayloadNotify{
 				ProtocolID: ikev2.ProtoIKE,
 				NotifyType: ikev2.DEVICE_IDENTITY_3GPP,
 				NotifyData: data,
 			})
-			devicePayload := &ikev2.EncryptedPayloadNotify{
+			payloads = append(payloads, &ikev2.EncryptedPayloadNotify{
 				ProtocolID: ikev2.ProtoIKE,
 				NotifyType: ikev2.DEVICE_IDENTITY,
 				NotifyData: data,
-			}
-			payloads = append(payloads, devicePayload)
+			})
 		}
 	}
+
 	return payloads, nil
+}
+
+// spoofAppleIMEI 通过 IMSI 和指定的经典 iPhone TAC 动态合成高仿真 IMEI，并补齐正确的 Luhn 校验位
+func spoofAppleIMEI(imsi string) string {
+	tac := "35898336" // iPhone 15 Pro Max (A3106)
+	sn := imsi
+	if len(sn) >= 6 {
+		sn = sn[len(sn)-6:]
+	} else {
+		sn = "123456"
+	}
+	base := tac + sn
+	sum := 0
+	for i := 0; i < 14; i++ {
+		v := int(base[i] - '0')
+		if i%2 != 0 {
+			v *= 2
+			if v > 9 {
+				v -= 9
+			}
+		}
+		sum += v
+	}
+	check := (10 - (sum % 10)) % 10
+	return fmt.Sprintf("%s%d", base, check)
+}
+
+// encodeTBCD 将 15 位 ASCII IMEI 字符串转化为 3GPP 强制标准的 8 字节 TBCD 逆序对流 (Telephony Binary Coded Decimal)
+func encodeTBCD(imei string) []byte {
+	imei += "F" // 补足到 16 位以满置末尾的高 4 bit
+	encoded := make([]byte, 8)
+	for i := 0; i < 8; i++ {
+		d1 := imei[i*2]
+		d2 := imei[i*2+1]
+		val1 := d1 - '0'
+		var val2 byte
+		if d2 == 'F' {
+			val2 = 0x0F
+		} else {
+			val2 = d2 - '0'
+		}
+		encoded[i] = (val2 << 4) | val1
+	}
+	return encoded
 }
 
 // handleEAP 处理从 ePDG 接收到的 EAP (Extensible Authentication Protocol) 报文。
@@ -159,8 +214,35 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		return nil, nil // Stop EAP loop
 	}
 
+	if pkt.Code == eap.CodeFailure {
+		// EAP Failure (Code 4)：ePDG/AAA 拒绝了认证
+		// 尝试从原始包中提取更多诊断信息
+		s.Logger.Error("收到 EAP Failure，ePDG/AAA 拒绝认证",
+			logger.String("raw_hex", fmt.Sprintf("%x", eapRaw)),
+			logger.Int("identifier", int(pkt.Identifier)),
+			logger.Int("eap_type", int(pkt.Type)),
+			logger.Int("subtype", int(pkt.Subtype)))
+
+		// 某些 ePDG 虽然发 Code=4 但仍携带 AKA Notification 子类型和 AT_NOTIFICATION 属性
+		if (pkt.Type == eap.TypeAKA || pkt.Type == eap.TypeAKAPrime) && len(pkt.Data) > 0 {
+			if attrs, err := eap.ParseAttributes(pkt.Data); err == nil {
+				if atNotif, ok := attrs[eap.AT_NOTIFICATION]; ok && len(atNotif.Value) >= 2 {
+					notifCode := uint16(atNotif.Value[0])<<8 | uint16(atNotif.Value[1])
+					s.Logger.Error("EAP Failure 携带 AT_NOTIFICATION 错误码",
+						logger.Int("notification_code", int(notifCode)),
+						logger.String("meaning", eap.NotificationCodeToString(notifCode)))
+					return nil, fmt.Errorf("EAP 认证被拒绝 (Code=%d, AT_NOTIFICATION=%d: %s)",
+						pkt.Code, notifCode, eap.NotificationCodeToString(notifCode))
+				}
+			}
+		}
+
+		return nil, fmt.Errorf("EAP 认证被拒绝 (Code=%d, Type=%d, Subtype=%d, raw=%x)",
+			pkt.Code, pkt.Type, pkt.Subtype, eapRaw)
+	}
+
 	if pkt.Code != eap.CodeRequest {
-		return nil, fmt.Errorf("unexpected EAP Code: %d", pkt.Code)
+		return nil, fmt.Errorf("unexpected EAP Code: %d (raw=%x)", pkt.Code, eapRaw)
 	}
 
 	// 处理身份请求
@@ -187,6 +269,126 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		return []ikev2.Payload{eapPayload}, nil
 	}
 
+	// -------------------------------------------------------------
+	// EAP-AKA / EAP-AKA' Identity Request (RFC 4187 § 4.1.4 / RFC 5448)
+	// (Type 23 or 50, Subtype 5)
+	// -------------------------------------------------------------
+	if (pkt.Type == eap.TypeAKA || pkt.Type == eap.TypeAKAPrime) && pkt.Subtype == eap.SubtypeIdentity {
+		attrs, _ := eap.ParseAttributes(pkt.Data)
+		var keys []uint8
+		for k := range attrs {
+			keys = append(keys, k)
+		}
+		s.Logger.Info("收到 EAP-AKA/AKA' Identity Request (Subtype 5), 准备提交身份标识",
+			logger.Int("eap_type", int(pkt.Type)),
+			logger.Any("req_attrs", keys))
+
+		imsi, err := s.cfg.SIM.GetIMSI()
+		if err != nil {
+			return nil, fmt.Errorf("读取 IMSI 失败: %w", err)
+		}
+
+		// 如果收到了 AT_PERMANENT_ID_REQ 或者是泛泛的 Identity 请求
+		// 根据 RFC 4187 §4.1.4，这里应该回复 Permanent Identity。
+		// 在 3GPP 中，EAP-AKA 的 Permanent Identity 常规为 "0" + IMSI 或者 "0" + IMSI + "@realm"
+		// 很多 ePDG 对 Identity 请求只接受 username 部分（即 0+IMSI）或者必须和发起时完全一致的 NAI。
+		// IKE_SA_INIT 用了带有 @ 后面的全名。如果 ePDG 要求 Permanent Identity，
+		// 通常回复完整 NAI 也是可以的，但部分严格网卡只认 "0" + IMSI。
+		// 还有一点：如果在 Identity 请求包含了 AT_ANY_ID_REQ，设备也可自行返回假名。
+		// 不过这里保守起见，保持和初始 IKE_AUTH 中的 IDi 相同，即完整的 NAI：
+		nai := buildNAI(imsi, s.cfg)
+
+		// 检查 ePDG 是否请求了明文 IMSI (AT_PERMANENT_ID_REQ = 10) 或 AT_ANY_ID_REQ = 13
+		_, hasPermReq := attrs[eap.AT_PERMANENT_ID_REQ]
+		_, hasAnyIdReq := attrs[eap.AT_ANY_ID_REQ]
+
+		if hasPermReq || hasAnyIdReq {
+			// RFC 4187 要求返回 Permanent Identity (或者伪装名，这里我们总是出示真实 Permanent Identity)
+			// 根据 3GPP TS 23.003 §19.3.2，EAP-AKA 的 Permanent Identity 必须遵循 NAI 格式: "0" + IMSI + "@nai.epc.mncXXX.mccYYY.3gppnetwork.org"
+			// 也就是说它依然带有 @ 域名后缀。我们直接使用 buildNAI 即可。
+			nai = buildNAI(imsi, s.cfg)
+			s.Logger.Info("服务器要求出示 Identity，提供包含 Realm 的 3GPP Permanent NAI", logger.String("permanent_id", nai))
+		}
+
+		// RFC 4187 §10.7: AT_IDENTITY Value = ActualLength(2 bytes) + Identity
+		naiBytes := []byte(nai)
+		identityValue := make([]byte, 2+len(naiBytes))
+		identityValue[0] = byte(len(naiBytes) >> 8)
+		identityValue[1] = byte(len(naiBytes))
+		copy(identityValue[2:], naiBytes)
+
+		atIdentity := &eap.Attribute{
+			Type:  eap.AT_IDENTITY,
+			Value: identityValue,
+		}
+
+		respData := atIdentity.Encode()
+
+		// 如果对方附加了 AT_ANY_ID_REQ，RFC 4187 要求我们也须在 Identity 回包中原样回显
+		if hasAnyIdReq {
+			atAnyIdReq := &eap.Attribute{
+				Type:  eap.AT_ANY_ID_REQ,
+				Value: []byte{}, // 根据 RFC 4187 §10.19，此属性长度必定为 1 (即包含类型和长度符自身共 4 字节)，所以数据区空即可
+			}
+			respData = append(respData, atAnyIdReq.Encode()...)
+		}
+
+		respPkt := &eap.EAPPacket{
+			Code:       eap.CodeResponse,
+			Identifier: pkt.Identifier,
+			Type:       pkt.Type,
+			Subtype:    eap.SubtypeIdentity,
+			Data:       respData,
+		}
+
+		encodedResp := respPkt.Encode()
+		s.Logger.Debug("已构造 EAP Identity Response",
+			logger.String("identity", nai),
+			logger.Bool("with_any_id_req", hasAnyIdReq),
+			logger.String("hex", fmt.Sprintf("%x", encodedResp)))
+
+		eapPayload := &ikev2.EncryptedPayloadEAP{EAPMessage: encodedResp}
+		return []ikev2.Payload{eapPayload}, nil
+	}
+
+	// -------------------------------------------------------------
+	// EAP-AKA / EAP-AKA' Notification Request (Subtype 12)
+	// 某些运营商会在 Challenge 前先发 Notification 探测客户端状态，需回包 ACK。
+	// -------------------------------------------------------------
+	if (pkt.Type == eap.TypeAKA || pkt.Type == eap.TypeAKAPrime) && pkt.Subtype == eap.SubtypeNotification {
+		attrs, _ := eap.ParseAttributes(pkt.Data)
+		respData := []byte{}
+		if atNotif, ok := attrs[eap.AT_NOTIFICATION]; ok {
+			respData = append(respData, (&eap.Attribute{
+				Type:  eap.AT_NOTIFICATION,
+				Value: append([]byte(nil), atNotif.Value...),
+			}).Encode()...)
+			if len(atNotif.Value) >= 2 {
+				notifCode := uint16(atNotif.Value[0])<<8 | uint16(atNotif.Value[1])
+				s.Logger.Info("收到 EAP-AKA Notification 请求",
+					logger.Int("notification_code", int(notifCode)),
+					logger.String("meaning", eap.NotificationCodeToString(notifCode)))
+			}
+		} else {
+			s.Logger.Info("收到 EAP-AKA Notification 请求（未携带 AT_NOTIFICATION）")
+		}
+
+		respPkt := &eap.EAPPacket{
+			Code:       eap.CodeResponse,
+			Identifier: pkt.Identifier,
+			Type:       pkt.Type,
+			Subtype:    eap.SubtypeNotification,
+			Data:       respData,
+		}
+		encodedResp := respPkt.Encode()
+		s.Logger.Debug("已构造 EAP Notification Response",
+			logger.Int("eap_type", int(pkt.Type)),
+			logger.String("hex", fmt.Sprintf("%x", encodedResp)))
+
+		eapPayload := &ikev2.EncryptedPayloadEAP{EAPMessage: encodedResp}
+		return []ikev2.Payload{eapPayload}, nil
+	}
+
 	// 处理 AKA 挑战
 	if pkt.Type == eap.TypeAKA && pkt.Subtype == eap.SubtypeChallenge {
 		s.Logger.Info("收到 EAP-AKA Challenge (4G 模式)")
@@ -205,6 +407,28 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 			keys = append(keys, k)
 		}
 		s.Logger.Debug("Received EAP-AKA Challenge attributes", logger.Any("keys", keys))
+
+		// Challenge 可选协商属性：AT_BIDDING / AT_RESULT_IND
+		// 为提升与严格 AAA 的兼容性，这里按请求回显。
+		atBidding, hasBidding := attrs[eap.AT_BIDDING]
+		if hasBidding {
+			s.Logger.Info("服务器下发 AT_BIDDING，将在 EAP-AKA Response 中回显")
+			s.Logger.Debug("EAP-AKA Challenge 字段摘要", logger.String("at_bidding", eapAttrDigest(atBidding.Value)))
+		}
+		atResultInd, hasResultInd := attrs[eap.AT_RESULT_IND]
+		if hasResultInd {
+			s.Logger.Info("服务器下发 AT_RESULT_IND，将在 EAP-AKA Response 中声明支持受保护成功指示")
+			s.Logger.Debug("EAP-AKA Challenge 字段摘要", logger.String("at_result_ind", eapAttrDigest(atResultInd.Value)))
+		}
+		if ok1 {
+			s.Logger.Debug("EAP-AKA Challenge 字段摘要", logger.String("at_rand", eapAttrDigest(atRand.Value)))
+		}
+		if ok2 {
+			s.Logger.Debug("EAP-AKA Challenge 字段摘要", logger.String("at_autn", eapAttrDigest(atAutn.Value)))
+		}
+		if ok3 {
+			s.Logger.Debug("EAP-AKA Challenge 字段摘要", logger.String("at_mac", eapAttrDigest(atMac.Value)))
+		}
 
 		if !ok1 || !ok2 {
 			return nil, errors.New("AKA 挑战中缺少 RAND 或 AUTN")
@@ -226,16 +450,17 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		res, ck, ik, auts, err := s.cfg.SIM.CalculateAKA(randVal, autnVal)
 		if err != nil {
 			if errors.Is(err, sim.ErrSyncFailure) {
-				// 发送同步失败
-				// 载荷: EAP-Response/AKA-Sync-Failure
-				// 属性: AT_AUTS
 				return s.buildEAPSyncFailure(pkt.Identifier, auts)
 			}
 			return nil, fmt.Errorf("SIM AKA failed: %v", err)
 		}
-
 		imsi, _ := s.cfg.SIM.GetIMSI()
 		identity := []byte(buildNAI(imsi, s.cfg))
+		s.Logger.Debug("AKA 密码材料计算原始材料",
+			logger.String("identity", string(identity)),
+			logger.String("ik_hex", fmt.Sprintf("%x", ik)),
+			logger.String("ck_hex", fmt.Sprintf("%x", ck)),
+			logger.String("res_hex", fmt.Sprintf("%x", res)))
 
 		derive := func(order int) (kAut []byte, msk []byte, mk []byte, err error) {
 			h := sha1.New()
@@ -267,18 +492,14 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 			if err != nil {
 				return nil, err
 			}
-			if s.cfg.DisableEAPMACValidation {
-				kAut = kAutTry
-				msk = mskTry
-				macVerified = true
-				break
-			}
+
 			if err := verifyEAPAKAMAC(eapRaw, pkt.Data, kAutTry, recvMac); err == nil {
 				kAut = kAutTry
 				msk = mskTry
 				macVerified = true
 				break
 			} else {
+				s.Logger.Warn("❌ 本地 MAC 校验失败", logger.Int("order", order), logger.String("err", err.Error()))
 				lastMacErr = err
 			}
 		}
@@ -291,7 +512,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		// Removed duplicate AT_NEXT_REAUTH_ID check here to avoid buggy string(Value) conversion.
 
 		// 构造响应
-		// 属性: AT_RES, AT_MAC
+		// 属性: AT_RES, [AT_RESULT_IND], [AT_BIDDING], AT_MAC
 
 		respAttrs := []byte{}
 
@@ -302,9 +523,25 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		atRes := &eap.Attribute{Type: eap.AT_RES, Value: resValue}
 		respAttrs = append(respAttrs, atRes.Encode()...)
 
-		// 增加 AT_ANY_ID_REQ 主动向服务端恳求下发 Fast Re-auth 假名
-		atAnyIdReq := &eap.Attribute{Type: eap.AT_ANY_ID_REQ, Value: make([]byte, 2)} // value is filled to 0 so size is 4 bytes total
-		respAttrs = append(respAttrs, atAnyIdReq.Encode()...)
+		if hasResultInd {
+			atResultInd := &eap.Attribute{Type: eap.AT_RESULT_IND, Value: []byte{}}
+			respAttrs = append(respAttrs, atResultInd.Encode()...)
+		}
+		if hasBidding {
+			// 优先回显服务端下发的 BIDDING 内容。
+			// 对部分严格网关，若回显为 0x0000 可能被视为“不支持 AKA'”，
+			// 这里保守置位最低位声明客户端支持 AKA'，以避免被降级策略拒绝。
+			biddingValue := make([]byte, 2)
+			if len(atBidding.Value) >= 2 {
+				copy(biddingValue, atBidding.Value[:2])
+			}
+			if biddingValue[0] == 0x00 && biddingValue[1] == 0x00 {
+				biddingValue[1] = 0x01
+				s.Logger.Info("AT_BIDDING 回显值为 0，已主动置位 AKA' 支持位", logger.String("bidding_hex", fmt.Sprintf("%x", biddingValue)))
+			}
+			atBiddingResp := &eap.Attribute{Type: eap.AT_BIDDING, Value: biddingValue}
+			respAttrs = append(respAttrs, atBiddingResp.Encode()...)
+		}
 
 		// AT_MAC
 		// 初始值为 16 字节零
@@ -337,15 +574,15 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		// 等等，EAP 头是 4 (Code, ID, Len). Type(1), Sub(1), Res(2). 总共 8。
 		// 所以数据从 8 开始。
 		macPos := 8 + macOffset + 4
+
+		s.Logger.Debug("即将为 EAP-AKA Response 计算 MAC",
+			logger.String("macPos", fmt.Sprintf("%d", macPos)),
+			logger.String("eapBytes_raw", fmt.Sprintf("%x", eapBytes)),
+			logger.String("kAut", fmt.Sprintf("%x", kAut)))
+
 		copy(eapBytes[macPos:], fullMac[:16])
 
 		eapPayload := &ikev2.EncryptedPayloadEAP{EAPMessage: eapBytes}
-		if s.PRFAlg != nil && s.Keys != nil && len(s.Keys.SK_pi) > 0 && len(s.msgBuffer) > 0 && len(s.nr) > 0 {
-			authPayloads, err := s.buildIKEAuthFinalPayloads()
-			if err == nil {
-				return append(authPayloads, eapPayload), nil
-			}
-		}
 
 		// 捕获 AT_NEXT_REAUTH_ID：若服务端下发了假名，则缓存供下次断线快连用
 		if atNextReauthID, ok := attrs[eap.AT_NEXT_REAUTH_ID]; ok && len(atNextReauthID.Value) > 2 {
@@ -501,10 +738,12 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		if err != nil {
 			return nil, err
 		}
-		if !s.cfg.DisableEAPMACValidation {
-			if err := verifyEAPAKAPrimeMAC(eapRaw, pkt.Data, kAut, recvMac); err != nil {
-				return nil, fmt.Errorf("AKA' MAC 校验失败: %v", err)
-			}
+
+		if err := verifyEAPAKAPrimeMAC(eapRaw, pkt.Data, kAut, recvMac); err != nil {
+			s.Logger.Error("❌ AKA' 本地 MAC 校验失败！", logger.String("err", err.Error()))
+			return nil, fmt.Errorf("AKA' MAC 校验失败: %v", err)
+		} else {
+			s.Logger.Info("✅ 本地 MAC 校验服务器下发的 EAP-AKA' 挑战包通过！")
 		}
 
 		s.MSK = msk
@@ -534,10 +773,6 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		atRes := &eap.Attribute{Type: eap.AT_RES, Value: resValue}
 		respAttrs = append(respAttrs, atRes.Encode()...)
 
-		// 增加 AT_ANY_ID_REQ 主动向 5G ePDG 恳求下发 Fast Re-auth 假名
-		atAnyIdReq := &eap.Attribute{Type: eap.AT_ANY_ID_REQ, Value: make([]byte, 2)}
-		respAttrs = append(respAttrs, atAnyIdReq.Encode()...)
-
 		// AT_MAC (占位 16 字节零)
 		respMacAttr := &eap.Attribute{Type: eap.AT_MAC, Value: make([]byte, 18)}
 		macOffset := len(respAttrs)
@@ -565,17 +800,18 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		fullRespMac := respMacCalc.Sum(nil)
 
 		macPos := 8 + macOffset + 4
+
+		s.Logger.Debug("即将为 EAP-AKA' Response 计算 MAC",
+			logger.String("macPos", fmt.Sprintf("%d", macPos)),
+			logger.String("eapBytes_raw", fmt.Sprintf("%x", eapBytes)),
+			logger.String("kAut", fmt.Sprintf("%x", kAut)))
+
 		copy(eapBytes[macPos:], fullRespMac[:16])
 
 		s.Logger.Info("EAP-AKA' Challenge 响应构建完成 (5G KDF-SHA256)")
 
 		eapPayload := &ikev2.EncryptedPayloadEAP{EAPMessage: eapBytes}
-		if s.PRFAlg != nil && s.Keys != nil && len(s.Keys.SK_pi) > 0 && len(s.msgBuffer) > 0 && len(s.nr) > 0 {
-			authPayloads, err := s.buildIKEAuthFinalPayloads()
-			if err == nil {
-				return append(authPayloads, eapPayload), nil
-			}
-		}
+
 		return []ikev2.Payload{eapPayload}, nil
 	}
 
@@ -720,6 +956,17 @@ func eapAKAAttrTail16(v []byte) ([]byte, error) {
 	return v[len(v)-16:], nil
 }
 
+func eapAttrDigest(v []byte) string {
+	if len(v) == 0 {
+		return "len=0"
+	}
+	hex := fmt.Sprintf("%x", v)
+	if len(hex) <= 24 {
+		return fmt.Sprintf("len=%d hex=%s", len(v), hex)
+	}
+	return fmt.Sprintf("len=%d hex=%s...%s", len(v), hex[:12], hex[len(hex)-12:])
+}
+
 func verifyEAPAKAMAC(eapRaw []byte, attrsData []byte, kAut []byte, recvMac []byte) error {
 	macAttrOffset, ok := findEAPAttrOffset(attrsData, eap.AT_MAC)
 	if !ok {
@@ -740,6 +987,13 @@ func verifyEAPAKAMAC(eapRaw []byte, attrsData []byte, kAut []byte, recvMac []byt
 	fullMac := mac.Sum(nil)
 
 	if !hmac.Equal(fullMac[:16], recvMac) {
+		logger.Debug("EAP-AKA MAC 计算不匹配",
+			logger.String("kAut", fmt.Sprintf("%x", kAut)),
+			logger.String("macPos", fmt.Sprintf("%d", macPos)),
+			logger.String("tmpHex", fmt.Sprintf("%x", tmp)),
+			logger.String("eapRaw", fmt.Sprintf("%x", eapRaw)),
+			logger.String("recvMac", fmt.Sprintf("%x", recvMac)),
+			logger.String("calcMac", fmt.Sprintf("%x", fullMac[:16])))
 		return errors.New("EAP-AKA AT_MAC 校验失败")
 	}
 	return nil

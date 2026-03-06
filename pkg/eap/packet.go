@@ -26,7 +26,9 @@ const (
 	SubtypeAuthReject       = 2
 	SubtypeSyncFailure      = 4
 	SubtypeIdentity         = 5
+	SubtypeNotification     = 12
 	SubtypeReauthentication = 13 // Fast Re-authentication (RFC 4187 §5)
+	SubtypeClientError      = 14 // 客户端错误 (RFC 4187)
 )
 
 // AKA 属性
@@ -55,6 +57,8 @@ const (
 	AT_ENCR_DATA         = 130 // 加密数据 (RFC 4187 §10.12)
 	AT_NEXT_PSEUDONYM    = 132 // 下次的临时假名
 	AT_NEXT_REAUTH_ID    = 133 // 下次的快速重认证 ID (RFC 4187 §10.15)
+	AT_RESULT_IND        = 134 // 受保护的成功指示 (RFC 4187 §10.16)
+	AT_BIDDING           = 136 // 防止降级攻击指示 (RFC 5448 §3.3)
 )
 
 type EAPPacket struct {
@@ -86,11 +90,10 @@ func Parse(data []byte) (*EAPPacket, error) {
 			p.Type = data[4]
 			currentLen++
 
-			if p.Type == TypeAKA {
+			if p.Type == TypeAKA || p.Type == TypeAKAPrime {
 				if length > 5 {
 					p.Subtype = data[5]
-					// 保留 2 字节？不。
-					// EAP-AKA 格式: Code, ID, Len, Type, Subtype, Reserved(2), Attributes...
+					// EAP-AKA/AKA' 格式: Code, ID, Len, Type, Subtype, Reserved(2), Attributes...
 					currentLen += 3 // Subtype(1) + Reserved(2)
 
 					if length > 8 {
@@ -111,7 +114,7 @@ func (p *EAPPacket) Encode() []byte {
 	length := 4
 	if p.Code == CodeRequest || p.Code == CodeResponse {
 		length++ // Type
-		if p.Type == TypeAKA {
+		if p.Type == TypeAKA || p.Type == TypeAKAPrime {
 			length += 3 // 子类型 + 保留
 			length += len(p.Data)
 		} else {
@@ -126,7 +129,7 @@ func (p *EAPPacket) Encode() []byte {
 
 	if p.Code == CodeRequest || p.Code == CodeResponse {
 		buf[4] = p.Type
-		if p.Type == TypeAKA {
+		if p.Type == TypeAKA || p.Type == TypeAKAPrime {
 			buf[5] = p.Subtype
 			buf[6] = 0 // Reserved
 			buf[7] = 0

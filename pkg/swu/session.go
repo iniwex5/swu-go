@@ -428,10 +428,15 @@ func (s *Session) connectOnce() error {
 			// 处理载荷
 			var eapPayload *ikev2.EncryptedPayloadEAP
 			// var authPayload *ikev2.EncryptedPayloadAuth
+			var notifyPayloads []*ikev2.EncryptedPayloadNotify
 
 			for _, p := range payloads {
 				if e, ok := p.(*ikev2.EncryptedPayloadEAP); ok {
 					eapPayload = e
+				}
+				// 收集 Notify 载荷（ePDG 在 EAP Failure 时通常会附带错误类 Notify）
+				if n, ok := p.(*ikev2.EncryptedPayloadNotify); ok {
+					notifyPayloads = append(notifyPayloads, n)
 				}
 				// 检查 AUTH (成功)
 				if _, ok := p.(*ikev2.EncryptedPayloadAuth); ok {
@@ -449,6 +454,16 @@ func (s *Session) connectOnce() error {
 				// 处理 EAP
 				respEAP, err := s.handleEAP(eapPayload.EAPMessage)
 				if err != nil {
+					// EAP 处理失败时，输出同一 IKE_AUTH 响应中伴随的 Notify 载荷
+					if len(notifyPayloads) > 0 {
+						for _, n := range notifyPayloads {
+							s.Logger.Error("EAP 失败时伴随的 IKEv2 Notify 载荷",
+								logger.Int("notify_type", int(n.NotifyType)),
+								logger.String("notify_name", ikev2.NotifyTypeToString(n.NotifyType)),
+								logger.Int("data_len", len(n.NotifyData)),
+								logger.String("data_hex", fmt.Sprintf("%x", n.NotifyData)))
+						}
+					}
 					return err
 				}
 
@@ -465,15 +480,26 @@ func (s *Session) connectOnce() error {
 
 			if len(s.MSK) == 0 {
 				var types []int
-				var notifies []uint16
+				var notifySummaries []string
+				var firstErrNotify *ikev2.EncryptedPayloadNotify
 				for _, pl := range payloads {
 					types = append(types, int(pl.Type()))
 					if n, ok := pl.(*ikev2.EncryptedPayloadNotify); ok {
-						notifies = append(notifies, n.NotifyType)
+						notifySummaries = append(notifySummaries, fmt.Sprintf("%d(%s)", n.NotifyType, ikev2.NotifyTypeToString(n.NotifyType)))
+						if n.NotifyType < 16384 && firstErrNotify == nil {
+							firstErrNotify = n
+						}
 					}
 				}
-				if len(notifies) > 0 {
-					return fmt.Errorf("对端未返回 EAP 载荷(payloadTypes=%v notifyTypes=%v)，无法继续 EAP-AKA", types, notifies)
+				if firstErrNotify != nil {
+					return fmt.Errorf("IKE_AUTH 被对端拒绝: notify=%d(%s) data=%x payloadTypes=%v",
+						firstErrNotify.NotifyType,
+						ikev2.NotifyTypeToString(firstErrNotify.NotifyType),
+						firstErrNotify.NotifyData,
+						types)
+				}
+				if len(notifySummaries) > 0 {
+					return fmt.Errorf("对端未返回 EAP 载荷(payloadTypes=%v notifyTypes=%v)，无法继续 EAP-AKA", types, notifySummaries)
 				}
 				return fmt.Errorf("对端未返回 EAP 载荷(payloadTypes=%v)，无法继续 EAP-AKA", types)
 			}
