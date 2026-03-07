@@ -43,6 +43,7 @@ func (m *SessionManager) Start(ctx context.Context, id string, cfg *Config) (*Se
 
 	go func() {
 		if err := s.Connect(sessCtx); err != nil && !errors.Is(err, context.Canceled) {
+			s.setTerminalError(err)
 			logger.Error("ePDG 会话退出", logger.Err(err))
 		}
 	}()

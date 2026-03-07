@@ -1,7 +1,6 @@
 package swu
 
 import (
-	"crypto/hmac"
 	"encoding/binary"
 	"errors"
 
@@ -19,9 +18,7 @@ func (s *Session) GenerateIKESAKeys(peerNonce []byte) error {
 	seed := append(s.ni, peerNonce...)
 
 	prf := s.PRFAlg
-	mac := hmac.New(prf.Hash, seed)
-	mac.Write(s.DH.SharedKey)
-	skeyseed := mac.Sum(nil)
+	skeyseed := prf.Compute(seed, s.DH.SharedKey)
 
 	// 2. 计算密钥
 	totalLen := 0
@@ -108,9 +105,7 @@ func (s *Session) GenerateIKESARekeyKeys(
 	data = append(data, ni...)
 	data = append(data, nr...)
 
-	mac := hmac.New(prf.Hash, oldSKd)
-	mac.Write(data)
-	skeyseed := mac.Sum(nil)
+	skeyseed := prf.Compute(oldSKd, data)
 
 	// 2. 计算密钥材料长度
 	prfKeyLen := prf.KeyLen()
