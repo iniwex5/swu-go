@@ -790,6 +790,10 @@ func (s *Session) startNetEventMonitor() {
 					s.Logger.Warn("基站/路由器发来链路断开 ICMP (Host Unreachable)，触发 DPD/MOBIKE 预判探活",
 						logger.String("reason", ev.Reason))
 					// 直接发起一次 DPD 加速验证，如果在发 DPD 期间发生漂移将直接救活。
+					if s.Keys == nil || s.EncAlg == nil {
+						s.Logger.Warn("收到 ICMP 但当前会话密钥未生成完，舍弃智能 DPD 以免 Panic")
+						break
+					}
 					go func() {
 						if err := s.sendDPD(); err != nil {
 							s.Logger.Warn("智能 DPD 探测失败", logger.Err(err))
@@ -1934,13 +1938,13 @@ func (s *Session) startDataPlaneLoop() {
 
 			espSendCount++
 			if espSendCount <= 10 || espSendCount%100 == 0 {
-				s.Logger.Debug("ESP 已发送",
-					logger.Uint64("count", espSendCount),
-					logger.String("dstIP", dstIP),
-					logger.Int("proto", int(proto)),
-					logger.Int("plainLen", n),
-					logger.Int("espLen", len(espPacket)),
-					logger.Uint32("spi", saOut.SPI))
+				// s.Logger.Debug("ESP 已发送",
+				// 	logger.Uint64("count", espSendCount),
+				// 	logger.String("dstIP", dstIP),
+				// 	logger.Int("proto", int(proto)),
+				// 	logger.Int("plainLen", n),
+				// 	logger.Int("espLen", len(espPacket)),
+				// 	logger.Uint32("spi", saOut.SPI))
 			}
 		}
 		s.Logger.Info("TUN->ESP 循环退出", logger.Uint64("tunRead", tunReadCount), logger.Uint64("espSend", espSendCount), logger.Uint64("saDrop", saDropCount))
@@ -1993,11 +1997,11 @@ func (s *Session) startDataPlaneLoop() {
 
 			tunWriteCount++
 			if tunWriteCount <= 10 || tunWriteCount%100 == 0 {
-				logger.Debug("TUN 已写入",
-					logger.Uint64("count", tunWriteCount),
-					logger.String("srcIP", srcIP),
-					logger.Int("len", len(packet)),
-					logger.Uint32("spi", spi))
+				// logger.Debug("TUN 已写入",
+				// 	logger.Uint64("count", tunWriteCount),
+				// 	logger.String("srcIP", srcIP),
+				// 	logger.Int("len", len(packet)),
+				// 	logger.Uint32("spi", spi))
 			}
 		}
 		logger.Info("ESP->TUN 循环退出", logger.Uint64("espRecv", espRecvCount), logger.Uint64("tunWrite", tunWriteCount))

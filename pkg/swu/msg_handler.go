@@ -201,6 +201,10 @@ func (s *Session) encryptAndWrapWithMsgID(payloads []ikev2.Payload, exchangeType
 		innerData = append(innerData, body...)
 	}
 
+	if s.Keys == nil || s.EncAlg == nil {
+		return nil, errors.New("会话密钥或加密算法尚未初始化，无法加密载荷")
+	}
+
 	key := s.Keys.SK_ei
 	iv, err := crypto.RandomBytes(s.EncAlg.IVSize())
 	if err != nil {
