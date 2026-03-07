@@ -44,6 +44,9 @@ type Config struct {
 	// 是否在 IKE_AUTH 中注入伪造 DEVICE_IDENTITY（IMEI）
 	// 默认 false：遵循标准终端行为，避免触发运营商风控拒绝。
 	EnableDeviceIdentitySpoof bool
+	DeviceIdentityIMEI        string
+	AKAChallengeMode          string
+	AKAIdentityMode           string
 
 	EnableWiresharkKeyLog bool
 	WiresharkKeyLogPath   string

@@ -5,6 +5,7 @@ import "net"
 type SessionSnapshot struct {
 	Established bool
 	TUNName     string
+	LastError   string
 
 	IPv4       net.IP
 	IPv6       net.IP
@@ -20,6 +21,7 @@ type SessionSnapshot struct {
 func (s *Session) Snapshot() SessionSnapshot {
 	out := SessionSnapshot{}
 	out.Established = s.ChildSAIn != nil && s.ChildSAOut != nil
+	out.LastError = s.terminalError()
 	// 启用了数据平面驱动时
 	if s.cfg.EnableDriver {
 		if s.cfg.DataplaneMode == "xfrmi" {

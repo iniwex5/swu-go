@@ -120,3 +120,59 @@ func TestRandomBytes(t *testing.T) {
 		t.Errorf("长度错误: got %d, want 32", len(b1))
 	}
 }
+
+func TestECDHSharedSecretP256(t *testing.T) {
+	a, err := NewDiffieHellman(19)
+	if err != nil {
+		t.Fatalf("new dh a: %v", err)
+	}
+	b, err := NewDiffieHellman(19)
+	if err != nil {
+		t.Fatalf("new dh b: %v", err)
+	}
+	if err := a.GenerateKey(); err != nil {
+		t.Fatalf("a generate: %v", err)
+	}
+	if err := b.GenerateKey(); err != nil {
+		t.Fatalf("b generate: %v", err)
+	}
+	secA, err := a.ComputeSharedSecret(b.PublicKeyBytes())
+	if err != nil {
+		t.Fatalf("a shared: %v", err)
+	}
+	secB, err := b.ComputeSharedSecret(a.PublicKeyBytes())
+	if err != nil {
+		t.Fatalf("b shared: %v", err)
+	}
+	if !bytes.Equal(secA, secB) {
+		t.Fatal("p256 shared secret mismatch")
+	}
+}
+
+func TestECDHSharedSecretP384(t *testing.T) {
+	a, err := NewDiffieHellman(20)
+	if err != nil {
+		t.Fatalf("new dh a: %v", err)
+	}
+	b, err := NewDiffieHellman(20)
+	if err != nil {
+		t.Fatalf("new dh b: %v", err)
+	}
+	if err := a.GenerateKey(); err != nil {
+		t.Fatalf("a generate: %v", err)
+	}
+	if err := b.GenerateKey(); err != nil {
+		t.Fatalf("b generate: %v", err)
+	}
+	secA, err := a.ComputeSharedSecret(b.PublicKeyBytes())
+	if err != nil {
+		t.Fatalf("a shared: %v", err)
+	}
+	secB, err := b.ComputeSharedSecret(a.PublicKeyBytes())
+	if err != nil {
+		t.Fatalf("b shared: %v", err)
+	}
+	if !bytes.Equal(secA, secB) {
+		t.Fatal("p384 shared secret mismatch")
+	}
+}

@@ -31,7 +31,7 @@ func (s *Session) buildIKEAuthInitPayloads() ([]ikev2.Payload, error) {
 		if err != nil {
 			return nil, err
 		}
-		nai = buildNAI(imsi, s.cfg)
+		nai = buildAKAIdentity(imsi, s.cfg)
 	}
 	idPayload := &ikev2.EncryptedPayloadID{
 		IDType:      ikev2.ID_RFC822_ADDR,
@@ -74,8 +74,11 @@ func (s *Session) buildIKEAuthInitPayloads() ([]ikev2.Payload, error) {
 		binary.BigEndian.PutUint32(spiBytes, s.childSPI)
 	}
 
-	// 利用工厂方法生成覆盖高、中、低兼容性以及 ESN 处理的 Proposal 支持列表
-	proposals := ikev2.CreateMultiProposalESP(spiBytes)
+	// 使用配置驱动的 ESP Proposal；为空时回退到内置大兼容集合。
+	proposals, err := buildESPProposals(s.cfg.ESPProposals, spiBytes)
+	if err != nil {
+		return nil, err
+	}
 
 	// 如果用户级配置指定了只发开启 ESN，则后续可在此二次过滤
 	// 但默认状态我们发送大而全的列表
@@ -123,15 +126,31 @@ func (s *Session) buildIKEAuthInitPayloads() ([]ikev2.Payload, error) {
 	s.Logger.Debug("IKE_AUTH 已注入 INITIAL_CONTACT，要求 ePDG 清理旧隧道残留")
 
 	payloads := []ikev2.Payload{idPayload, idrPayload, cpPayload, saPayload, tsPayloadI, tsPayloadR, notifyPayload, mobikePayload, ticketReqPayload, initialContactPayload}
-	// 可选：注入 DEVICE_IDENTITY（伪造 IMEI）。
-	// 默认关闭，避免在严格风控网络上触发策略拒绝。
-	if s.cfg.EnableDeviceIdentitySpoof {
+	// 如果配置了直接覆盖的白名单 IMEI
+	if s.cfg.DeviceIdentityIMEI != "" {
+		s.Logger.Info("向 IKE_AUTH 注入指定的 DEVICE_IDENTITY (IMEI)", logger.String("imei", s.cfg.DeviceIdentityIMEI))
+		tbcdIMEI := encodeTBCD(s.cfg.DeviceIdentityIMEI)
+		data := make([]byte, 2+len(tbcdIMEI))
+		data[0] = 0x01
+		data[1] = byte(len(tbcdIMEI))
+		copy(data[2:], tbcdIMEI)
+
+		payloads = append(payloads, &ikev2.EncryptedPayloadNotify{
+			ProtocolID: ikev2.ProtoIKE,
+			NotifyType: ikev2.DEVICE_IDENTITY_3GPP,
+			NotifyData: data,
+		})
+		payloads = append(payloads, &ikev2.EncryptedPayloadNotify{
+			ProtocolID: ikev2.ProtoIKE,
+			NotifyType: ikev2.DEVICE_IDENTITY,
+			NotifyData: data,
+		})
+	} else if s.cfg.EnableDeviceIdentitySpoof {
 		if imsi, err := s.cfg.SIM.GetIMSI(); err == nil && imsi != "" {
 			spoofedIMEI := spoofAppleIMEI(imsi)
 			s.Logger.Info("已启用 DEVICE_IDENTITY 伪装，向 IKE_AUTH 注入伪造 iPhone 设备标识", logger.String("spoofed_imei", spoofedIMEI))
 
 			tbcdIMEI := encodeTBCD(spoofedIMEI)
-			// 遵循 3GPP TS 24.302 规范：1字节Type(1=IMEI) + 1字节Length + TBCD 编码串
 			data := make([]byte, 2+len(tbcdIMEI))
 			data[0] = 0x01
 			data[1] = byte(len(tbcdIMEI))
@@ -207,7 +226,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 
 	if pkt.Code == eap.CodeSuccess {
 		// EAP 成功！
-		s.Logger.Debug("收到 EAP Success")
+		s.Logger.Info("收到 EAP Success")
 		// 在 IKE_AUTH 中，EAP Success 通常伴随着服务器的 AUTH 载荷。
 		// 这在 session.go 的循环中处理。
 		// 我们这里只返回 nil 以表示不需要 EAP 响应。
@@ -255,7 +274,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 				logger.String("reauthID", identity))
 		} else {
 			imsi, _ := s.cfg.SIM.GetIMSI()
-			identity = buildNAI(imsi, s.cfg)
+			identity = buildAKAIdentity(imsi, s.cfg)
 		}
 
 		respPkt := &eap.EAPPacket{
@@ -296,7 +315,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		// 通常回复完整 NAI 也是可以的，但部分严格网卡只认 "0" + IMSI。
 		// 还有一点：如果在 Identity 请求包含了 AT_ANY_ID_REQ，设备也可自行返回假名。
 		// 不过这里保守起见，保持和初始 IKE_AUTH 中的 IDi 相同，即完整的 NAI：
-		nai := buildNAI(imsi, s.cfg)
+		nai := buildAKAIdentity(imsi, s.cfg)
 
 		// 检查 ePDG 是否请求了明文 IMSI (AT_PERMANENT_ID_REQ = 10) 或 AT_ANY_ID_REQ = 13
 		_, hasPermReq := attrs[eap.AT_PERMANENT_ID_REQ]
@@ -306,7 +325,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 			// RFC 4187 要求返回 Permanent Identity (或者伪装名，这里我们总是出示真实 Permanent Identity)
 			// 根据 3GPP TS 23.003 §19.3.2，EAP-AKA 的 Permanent Identity 必须遵循 NAI 格式: "0" + IMSI + "@nai.epc.mncXXX.mccYYY.3gppnetwork.org"
 			// 也就是说它依然带有 @ 域名后缀。我们直接使用 buildNAI 即可。
-			nai = buildNAI(imsi, s.cfg)
+			nai = buildAKAIdentity(imsi, s.cfg)
 			s.Logger.Info("服务器要求出示 Identity，提供包含 Realm 的 3GPP Permanent NAI", logger.String("permanent_id", nai))
 		}
 
@@ -359,10 +378,6 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		attrs, _ := eap.ParseAttributes(pkt.Data)
 		respData := []byte{}
 		if atNotif, ok := attrs[eap.AT_NOTIFICATION]; ok {
-			respData = append(respData, (&eap.Attribute{
-				Type:  eap.AT_NOTIFICATION,
-				Value: append([]byte(nil), atNotif.Value...),
-			}).Encode()...)
 			if len(atNotif.Value) >= 2 {
 				notifCode := uint16(atNotif.Value[0])<<8 | uint16(atNotif.Value[1])
 				s.Logger.Info("收到 EAP-AKA Notification 请求",
@@ -408,16 +423,27 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		}
 		s.Logger.Debug("Received EAP-AKA Challenge attributes", logger.Any("keys", keys))
 
-		// Challenge 可选协商属性：AT_BIDDING / AT_RESULT_IND
-		// 为提升与严格 AAA 的兼容性，这里按请求回显。
+		// Challenge 可选协商属性：AT_BIDDING / AT_CHECKCODE / AT_RESULT_IND
+		// 对齐安卓成功抓包与 strongSwan peer 行为：
+		// EAP-AKA Response/Challenge 默认仅发送 AT_RES + AT_MAC。
+		mode := s.cfg.AKAChallengeMode
+		if mode == "" {
+			mode = "minimal"
+		}
+
 		atBidding, hasBidding := attrs[eap.AT_BIDDING]
 		if hasBidding {
-			s.Logger.Info("服务器下发 AT_BIDDING，将在 EAP-AKA Response 中回显")
+			s.Logger.Info("服务器下发 AT_BIDDING", logger.String("aka_challenge_mode", mode))
 			s.Logger.Debug("EAP-AKA Challenge 字段摘要", logger.String("at_bidding", eapAttrDigest(atBidding.Value)))
+		}
+		atCheckcode, hasCheckcode := attrs[eap.AT_CHECKCODE]
+		if hasCheckcode {
+			s.Logger.Info("服务器下发 AT_CHECKCODE（当前仅记录）", logger.String("aka_challenge_mode", mode))
+			s.Logger.Debug("EAP-AKA Challenge 字段摘要", logger.String("at_checkcode", eapAttrDigest(atCheckcode.Value)))
 		}
 		atResultInd, hasResultInd := attrs[eap.AT_RESULT_IND]
 		if hasResultInd {
-			s.Logger.Info("服务器下发 AT_RESULT_IND，将在 EAP-AKA Response 中声明支持受保护成功指示")
+			s.Logger.Info("服务器下发 AT_RESULT_IND", logger.String("aka_challenge_mode", mode))
 			s.Logger.Debug("EAP-AKA Challenge 字段摘要", logger.String("at_result_ind", eapAttrDigest(atResultInd.Value)))
 		}
 		if ok1 {
@@ -455,7 +481,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 			return nil, fmt.Errorf("SIM AKA failed: %v", err)
 		}
 		imsi, _ := s.cfg.SIM.GetIMSI()
-		identity := []byte(buildNAI(imsi, s.cfg))
+		identity := []byte(buildAKAIdentity(imsi, s.cfg))
 		s.Logger.Debug("AKA 密码材料计算原始材料",
 			logger.String("identity", string(identity)),
 			logger.String("ik_hex", fmt.Sprintf("%x", ik)),
@@ -512,7 +538,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		// Removed duplicate AT_NEXT_REAUTH_ID check here to avoid buggy string(Value) conversion.
 
 		// 构造响应
-		// 属性: AT_RES, [AT_RESULT_IND], [AT_BIDDING], AT_MAC
+		// 属性: AT_RES, [AT_BIDDING], [AT_CHECKCODE], AT_MAC
 
 		respAttrs := []byte{}
 
@@ -523,24 +549,55 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		atRes := &eap.Attribute{Type: eap.AT_RES, Value: resValue}
 		respAttrs = append(respAttrs, atRes.Encode()...)
 
-		if hasResultInd {
-			atResultInd := &eap.Attribute{Type: eap.AT_RESULT_IND, Value: []byte{}}
-			respAttrs = append(respAttrs, atResultInd.Encode()...)
-		}
-		if hasBidding {
-			// 优先回显服务端下发的 BIDDING 内容。
-			// 对部分严格网关，若回显为 0x0000 可能被视为“不支持 AKA'”，
-			// 这里保守置位最低位声明客户端支持 AKA'，以避免被降级策略拒绝。
-			biddingValue := make([]byte, 2)
-			if len(atBidding.Value) >= 2 {
-				copy(biddingValue, atBidding.Value[:2])
+		switch mode {
+		case "minimal":
+			if hasBidding || hasCheckcode || hasResultInd {
+				s.Logger.Info("EAP-AKA 响应将忽略可选协商属性，仅发送 AT_RES+AT_MAC",
+					logger.String("aka_challenge_mode", mode),
+					logger.Bool("has_at_bidding", hasBidding),
+					logger.Bool("has_at_checkcode", hasCheckcode),
+					logger.Bool("has_at_result_ind", hasResultInd))
 			}
-			if biddingValue[0] == 0x00 && biddingValue[1] == 0x00 {
-				biddingValue[1] = 0x01
-				s.Logger.Info("AT_BIDDING 回显值为 0，已主动置位 AKA' 支持位", logger.String("bidding_hex", fmt.Sprintf("%x", biddingValue)))
+		case "force_bidding_aka":
+			if hasBidding {
+				respAttrs = append(respAttrs, (&eap.Attribute{
+					Type:  eap.AT_BIDDING,
+					Value: []byte{0x80, 0x00}, // 恢复正确的 Length=1 载荷
+				}).Encode()...)
 			}
-			atBiddingResp := &eap.Attribute{Type: eap.AT_BIDDING, Value: biddingValue}
-			respAttrs = append(respAttrs, atBiddingResp.Encode()...)
+			if hasCheckcode {
+				respAttrs = append(respAttrs, (&eap.Attribute{
+					Type:  eap.AT_CHECKCODE,
+					Value: append([]byte(nil), atCheckcode.Value...),
+				}).Encode()...)
+				s.Logger.Info("AT_CHECKCODE 原样回显", logger.String("value", eapAttrDigest(atCheckcode.Value)))
+			}
+			if hasResultInd {
+				s.Logger.Info("收到 AT_RESULT_IND（EAP-AKA 下不回显）")
+			}
+		default: // "echo"
+			if hasBidding {
+				val := []byte{0x00, 0x00}
+				if len(atBidding.Value) >= 2 {
+					val[0], val[1] = atBidding.Value[0], atBidding.Value[1]
+				}
+				s.Logger.Info("AT_BIDDING 严格原样回显",
+					logger.String("value", fmt.Sprintf("%02x%02x", val[0], val[1])))
+				respAttrs = append(respAttrs, (&eap.Attribute{
+					Type:  eap.AT_BIDDING,
+					Value: val,
+				}).Encode()...)
+			}
+			if hasCheckcode {
+				respAttrs = append(respAttrs, (&eap.Attribute{
+					Type:  eap.AT_CHECKCODE,
+					Value: append([]byte(nil), atCheckcode.Value...),
+				}).Encode()...)
+				s.Logger.Info("AT_CHECKCODE 原样回显", logger.String("value", eapAttrDigest(atCheckcode.Value)))
+			}
+			if hasResultInd {
+				s.Logger.Info("收到 AT_RESULT_IND（EAP-AKA 下不回显）")
+			}
 		}
 
 		// AT_MAC
@@ -595,7 +652,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 
 				// 派生加密密钥 K_encr (MK 的前 16 字节)
 				imsi, _ := s.cfg.SIM.GetIMSI()
-				identity := []byte(buildNAI(imsi, s.cfg))
+				identity := []byte(buildAKAIdentity(imsi, s.cfg))
 				h := sha1.New()
 				h.Write(identity)
 				h.Write(ik)
@@ -717,7 +774,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 
 		// RFC 5448 §3.4: MK = SHA-256(Identity|IK'|CK')
 		imsi, _ := s.cfg.SIM.GetIMSI()
-		identity := []byte(buildNAI(imsi, s.cfg))
+		identity := []byte(buildAKAIdentity(imsi, s.cfg))
 
 		mkHash := sha256.New()
 		mkHash.Write(identity)
@@ -1070,9 +1127,7 @@ func (s *Session) buildIKEAuthFinalPayloads() ([]ikev2.Payload, error) {
 		return nil, errors.New("PRF 不可用")
 	}
 
-	mac := hmac.New(prf.Hash, s.MSK)
-	mac.Write(keyPad)
-	authKey := mac.Sum(nil)
+	authKey := prf.Compute(s.MSK, keyPad)
 
 	// 2. 计算签名八位字节
 	// 2a. RealMessage1 (IKE_SA_INIT 请求)
@@ -1090,7 +1145,7 @@ func (s *Session) buildIKEAuthFinalPayloads() ([]ikev2.Payload, error) {
 	// 2c. prf(SK_pi, IDi_Body)
 	// 重建 IDi Body
 	imsi, _ := s.cfg.SIM.GetIMSI()
-	nai := buildNAI(imsi, s.cfg)
+	nai := buildAKAIdentity(imsi, s.cfg)
 
 	// ID 载荷主体: IDType(1 byte) + Reserved(3 bytes) + IDData
 	// IDType = ID_RFC822_ADDR (3)
@@ -1098,16 +1153,14 @@ func (s *Session) buildIKEAuthFinalPayloads() ([]ikev2.Payload, error) {
 	idiBody[0] = ikev2.ID_RFC822_ADDR
 	copy(idiBody[4:], []byte(nai))
 
-	macID := hmac.New(prf.Hash, s.Keys.SK_pi)
-	macID.Write(idiBody)
-	idHash := macID.Sum(nil)
+	idHash := prf.Compute(s.Keys.SK_pi, idiBody)
 
 	// 组合八位字节签名
-	macAuth := hmac.New(prf.Hash, authKey)
-	macAuth.Write(s.msgBuffer)
-	macAuth.Write(s.nr)
-	macAuth.Write(idHash)
-	authData := macAuth.Sum(nil)
+	signedOctets := make([]byte, 0, len(s.msgBuffer)+len(s.nr)+len(idHash))
+	signedOctets = append(signedOctets, s.msgBuffer...)
+	signedOctets = append(signedOctets, s.nr...)
+	signedOctets = append(signedOctets, idHash...)
+	authData := prf.Compute(authKey, signedOctets)
 
 	// 3. 构造 AUTH 载荷
 	authPayload := &ikev2.EncryptedPayloadAuth{
@@ -1349,7 +1402,7 @@ func (s *Session) handleIKEAuthFinalResp(data []byte) error {
 			if len(s.cpConfig.IPv6Addresses) > 0 && s.cpConfig.IPv6Addresses[0] != nil {
 				ipv6 = s.cpConfig.IPv6Addresses[0].String()
 			}
-			s.Logger.Debug("CP 配置已下发",
+			s.Logger.Info("CP 配置已下发",
 				logger.String("ipv4", ipv4),
 				logger.String("ipv6", ipv6),
 				logger.Int("dns_v4", len(s.cpConfig.IPv4DNS)),
@@ -1371,7 +1424,7 @@ func (s *Session) handleIKEAuthFinalResp(data []byte) error {
 		s.childOutPolicies = append(s.childOutPolicies, childOutPolicy{saOut: s.ChildSAOut, tsr: s.tsr})
 	}
 
-	s.Logger.Debug("Child SA 已建立", logger.Uint32("localSPI", s.childSPI), logger.Uint32("remoteSPI", remoteSPI))
+	s.Logger.Info("Child SA 已建立", logger.Uint32("localSPI", s.childSPI), logger.Uint32("remoteSPI", remoteSPI))
 	return nil
 }
 

@@ -47,6 +47,8 @@ func DefaultProposalMatcher() *ProposalMatcher {
 		},
 		SupportedDH: []AlgorithmType{
 			// 安全组
+			ECP_384_bit,
+			ECP_256_bit,
 			MODP_4096_bit,
 			MODP_3072_bit,
 			MODP_2048_bit, // IKEv2 最普及的安全底线
@@ -167,52 +169,34 @@ func (pm *ProposalMatcher) isAEAD(encr AlgorithmType) bool {
 
 // CreateMultiProposalIKE 创建涵盖高、中、低兼容级别的 IKE 提议
 func CreateMultiProposalIKE(spi []byte) []*Proposal {
-	proposals := []*Proposal{}
-	pNum := uint8(1)
-
-	// 提议 1: 高安全组 (AES-GCM-256 + SHA384 + DH15)
-	prop1 := NewProposal(pNum, ProtoIKE, spi)
-	prop1.AddTransformWithKeyLen(TransformTypeEncr, ENCR_AES_GCM_16, 256)
-	prop1.AddTransform(TransformTypePRF, PRF_HMAC_SHA2_384, 0)
-	prop1.AddTransform(TransformTypeDH, MODP_3072_bit, 0)
-	proposals = append(proposals, prop1)
-	pNum++
-
-	// 提议 2: 主流安全组 (AES-GCM-128 + SHA256 + DH14) - VoWiFi 常用
-	prop2 := NewProposal(pNum, ProtoIKE, spi)
-	prop2.AddTransformWithKeyLen(TransformTypeEncr, ENCR_AES_GCM_16, 128)
-	prop2.AddTransform(TransformTypePRF, PRF_HMAC_SHA2_256, 0)
-	prop2.AddTransform(TransformTypeDH, MODP_2048_bit, 0)
-	proposals = append(proposals, prop2)
-	pNum++
-
-	// 提议 3: 传统高安全组 (AES-CBC-256 + SHA256 + DH14)
-	prop3 := NewProposal(pNum, ProtoIKE, spi)
-	prop3.AddTransformWithKeyLen(TransformTypeEncr, ENCR_AES_CBC, 256)
-	prop3.AddTransform(TransformTypeInteg, AUTH_HMAC_SHA2_256_128, 0)
-	prop3.AddTransform(TransformTypePRF, PRF_HMAC_SHA2_256, 0)
-	prop3.AddTransform(TransformTypeDH, MODP_2048_bit, 0)
-	proposals = append(proposals, prop3)
-	pNum++
-
-	// 提议 4: 传统主流组 (AES-CBC-128 + SHA256 + DH14)
-	prop4 := NewProposal(pNum, ProtoIKE, spi)
-	prop4.AddTransformWithKeyLen(TransformTypeEncr, ENCR_AES_CBC, 128)
-	prop4.AddTransform(TransformTypeInteg, AUTH_HMAC_SHA2_256_128, 0)
-	prop4.AddTransform(TransformTypePRF, PRF_HMAC_SHA2_256, 0)
-	prop4.AddTransform(TransformTypeDH, MODP_2048_bit, 0)
-	proposals = append(proposals, prop4)
-	pNum++
-
-	// 提议 5: 远古兜底兼容组 (AES-CBC-128 + SHA1 + DH2)
-	prop5 := NewProposal(pNum, ProtoIKE, spi)
-	prop5.AddTransformWithKeyLen(TransformTypeEncr, ENCR_AES_CBC, 128)
-	prop5.AddTransform(TransformTypeInteg, AUTH_HMAC_SHA1_96, 0)
-	prop5.AddTransform(TransformTypePRF, PRF_HMAC_SHA1, 0)
-	prop5.AddTransform(TransformTypeDH, MODP_1024_bit, 0)
-	proposals = append(proposals, prop5)
-
-	return proposals
+	// 兼容策略：
+	// 1. 优先给出主流 HMAC-SHA2 组合
+	// 2. 其次给出老旧但常见的 HMAC-SHA1
+	// 3. 最后再回退到 AES-XCBC 族
+	//
+	// 这样可避免某些网络在“同一 Proposal 内含 XCBC”时直接选择 XCBC，
+	// 同时保留对仅支持 XCBC 的旧式 ePDG/AAA 设备的兼容能力。
+	makeProp := func(num uint8, integ, prf AlgorithmType) *Proposal {
+		prop := NewProposal(num, ProtoIKE, spi)
+		prop.AddTransformWithKeyLen(TransformTypeEncr, ENCR_AES_CBC, 128)
+		prop.AddTransformWithKeyLen(TransformTypeEncr, ENCR_AES_CBC, 256)
+		prop.AddTransform(TransformTypeInteg, integ, 0)
+		prop.AddTransform(TransformTypePRF, prf, 0)
+		prop.AddTransform(TransformTypeDH, MODP_1024_bit, 0)
+		prop.AddTransform(TransformTypeDH, MODP_1536_bit, 0)
+		prop.AddTransform(TransformTypeDH, MODP_2048_bit, 0)
+		// 保持原有首发兼容顺序不变，只追加 MODP3072 以提升对更现代 ePDG 的兼容性。
+		prop.AddTransform(TransformTypeDH, MODP_3072_bit, 0)
+		// 再追加 ECP 组，作为更现代网络的兼容项，但不改变现有 MODP 首发顺序。
+		prop.AddTransform(TransformTypeDH, ECP_256_bit, 0)
+		prop.AddTransform(TransformTypeDH, ECP_384_bit, 0)
+		return prop
+	}
+	return []*Proposal{
+		makeProp(1, AUTH_HMAC_SHA2_256_128, PRF_HMAC_SHA2_256),
+		makeProp(2, AUTH_HMAC_SHA1_96, PRF_HMAC_SHA1),
+		makeProp(3, AUTH_AES_XCBC_96, PRF_AES128_XCBC),
+	}
 }
 
 // CreateMultiProposalESP 创建涵盖高、中、低兼容级别的 ESP 提议

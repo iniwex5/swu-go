@@ -122,6 +122,8 @@ const (
 	MODP_4096_bit AlgorithmType = 16
 	MODP_6144_bit AlgorithmType = 17
 	MODP_8192_bit AlgorithmType = 18
+	ECP_256_bit  AlgorithmType = 19
+	ECP_384_bit  AlgorithmType = 20
 )
 
 // 属性类型
@@ -326,6 +328,10 @@ func DHToString(id uint16) string {
 		return "MODP_6144"
 	case MODP_8192_bit:
 		return "MODP_8192"
+	case ECP_256_bit:
+		return "ECP_256"
+	case ECP_384_bit:
+		return "ECP_384"
 	default:
 		if id == 0 {
 			return "NONE"

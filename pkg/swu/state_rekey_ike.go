@@ -37,8 +37,13 @@ func (s *Session) RekeyIKESA() error {
 		return fmt.Errorf("生成 Nonce 失败: %v", err)
 	}
 
-	// 2. 生成新 DH 密钥对 (MODP-2048)
-	newDH, err := crypto.NewDiffieHellman(14) // Group 14 = MODP-2048
+	// 2. 生成新 DH 密钥对
+	// 默认沿用当前 IKE SA 的 DH 组，避免在支持更高组的网络上 rekey 时退回 2048。
+	rekeyDHGroup := uint16(ikev2.MODP_2048_bit)
+	if s.DH != nil && s.DH.Group != 0 {
+		rekeyDHGroup = s.DH.Group
+	}
+	newDH, err := crypto.NewDiffieHellman(rekeyDHGroup)
 	if err != nil {
 		return fmt.Errorf("创建 DH 失败: %v", err)
 	}
@@ -56,14 +61,22 @@ func (s *Session) RekeyIKESA() error {
 	// 4. 构建 SA Proposal（ProtoIKE，SPI = 新 SPIi）
 	// 使用当前会话的加密/完整性/PRF/DH 算法
 	prop := ikev2.NewProposal(1, ikev2.ProtoIKE, newSPIiBytes)
+	encrKeyLenBits := s.ikeEncrKeyLenBits
+	if encrKeyLenBits == 0 {
+		encrKeyLenBits = 128
+	}
 	if s.ikeIsAEAD {
-		prop.AddTransformWithKeyLen(ikev2.TransformTypeEncr, ikev2.AlgorithmType(s.ikeEncrID), 128)
+		prop.AddTransformWithKeyLen(ikev2.TransformTypeEncr, ikev2.AlgorithmType(s.ikeEncrID), encrKeyLenBits)
 	} else {
-		prop.AddTransformWithKeyLen(ikev2.TransformTypeEncr, ikev2.AlgorithmType(s.ikeEncrID), 128)
+		prop.AddTransformWithKeyLen(ikev2.TransformTypeEncr, ikev2.AlgorithmType(s.ikeEncrID), encrKeyLenBits)
 		prop.AddTransform(ikev2.TransformTypeInteg, ikev2.AlgorithmType(s.ikeIntegID), 0)
 	}
-	prop.AddTransform(ikev2.TransformTypePRF, ikev2.PRF_HMAC_SHA2_256, 0)
-	prop.AddTransform(ikev2.TransformTypeDH, ikev2.MODP_2048_bit, 0)
+	prfID := ikev2.AlgorithmType(s.ikePRFID)
+	if prfID == 0 {
+		prfID = ikev2.PRF_HMAC_SHA2_256
+	}
+	prop.AddTransform(ikev2.TransformTypePRF, prfID, 0)
+	prop.AddTransform(ikev2.TransformTypeDH, ikev2.AlgorithmType(rekeyDHGroup), 0)
 
 	saPayload := &ikev2.EncryptedPayloadSA{
 		Proposals: []*ikev2.Proposal{prop},
@@ -71,7 +84,7 @@ func (s *Session) RekeyIKESA() error {
 
 	// 5. KE 载荷（新公钥）
 	kePayload := &ikev2.EncryptedPayloadKE{
-		DHGroup: ikev2.MODP_2048_bit,
+		DHGroup: ikev2.AlgorithmType(rekeyDHGroup),
 		KEData:  newDH.PublicKeyBytes(),
 	}
 
@@ -209,6 +222,7 @@ func (s *Session) HandleRekeyIKESARequest(msgID uint32, payloads []ikev2.Payload
 	var reqSA *ikev2.EncryptedPayloadSA
 	var reqNonce []byte
 	var reqKE []byte
+	reqKEGroup := uint16(ikev2.MODP_2048_bit)
 	var peerSPI uint64
 
 	for _, p := range payloads {
@@ -222,6 +236,7 @@ func (s *Session) HandleRekeyIKESARequest(msgID uint32, payloads []ikev2.Payload
 			reqNonce = pl.NonceData
 		case *ikev2.EncryptedPayloadKE:
 			reqKE = pl.KEData
+			reqKEGroup = uint16(pl.DHGroup)
 		}
 	}
 
@@ -236,7 +251,7 @@ func (s *Session) HandleRekeyIKESARequest(msgID uint32, payloads []ikev2.Payload
 	}
 
 	// 2. 生成新 DH 密钥对
-	newDH, err := crypto.NewDiffieHellman(14)
+	newDH, err := crypto.NewDiffieHellman(reqKEGroup)
 	if err != nil {
 		return fmt.Errorf("创建 DH 失败: %v", err)
 	}
@@ -263,7 +278,20 @@ func (s *Session) HandleRekeyIKESARequest(msgID uint32, payloads []ikev2.Payload
 	proposal := reqSA.Proposals[0]
 	respProp := ikev2.NewProposal(proposal.ProposalNum, ikev2.ProtoIKE, newSPIrBytes)
 	for _, t := range proposal.Transforms {
-		respProp.AddTransform(t.Type, ikev2.AlgorithmType(t.ID), 0) // KeyLen 简化处理
+		cloned := &ikev2.Transform{
+			Type: t.Type,
+			ID:   ikev2.AlgorithmType(t.ID),
+		}
+		if len(t.Attributes) > 0 {
+			cloned.Attributes = make([]*ikev2.TransformAttribute, 0, len(t.Attributes))
+			for _, attr := range t.Attributes {
+				cloned.Attributes = append(cloned.Attributes, &ikev2.TransformAttribute{
+					Type: attr.Type,
+					Val:  attr.Val,
+				})
+			}
+		}
+		respProp.Transforms = append(respProp.Transforms, cloned)
 	}
 
 	respSA := &ikev2.EncryptedPayloadSA{
@@ -271,7 +299,7 @@ func (s *Session) HandleRekeyIKESARequest(msgID uint32, payloads []ikev2.Payload
 	}
 
 	respKEPayload := &ikev2.EncryptedPayloadKE{
-		DHGroup: ikev2.MODP_2048_bit,
+		DHGroup: ikev2.AlgorithmType(reqKEGroup),
 		KEData:  newDH.PublicKeyBytes(),
 	}
 

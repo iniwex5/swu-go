@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"crypto/ecdh"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -175,6 +176,10 @@ type DiffieHellman struct {
 	SharedKey  []byte
 	P          *big.Int
 	G          *big.Int
+
+	ecdhCurve   ecdh.Curve
+	ecdhPrivKey *ecdh.PrivateKey
+	ecdhPubKey  *ecdh.PublicKey
 }
 
 func NewDiffieHellman(group uint16) (*DiffieHellman, error) {
@@ -205,6 +210,10 @@ func NewDiffieHellman(group uint16) (*DiffieHellman, error) {
 	case 18: // MODP 8192-bit (RFC 3526)
 		dh.P = prime8192
 		dh.G = gen2
+	case 19: // NIST P-256 (RFC 5903)
+		dh.ecdhCurve = ecdh.P256()
+	case 20: // NIST P-384 (RFC 5903)
+		dh.ecdhCurve = ecdh.P384()
 	default:
 		return nil, fmt.Errorf("不支持的 DH 组: %d", group)
 	}
@@ -213,6 +222,16 @@ func NewDiffieHellman(group uint16) (*DiffieHellman, error) {
 }
 
 func (dh *DiffieHellman) GenerateKey() error {
+	if dh.ecdhCurve != nil {
+		priv, err := dh.ecdhCurve.GenerateKey(rand.Reader)
+		if err != nil {
+			return err
+		}
+		dh.ecdhPrivKey = priv
+		dh.ecdhPubKey = priv.PublicKey()
+		return nil
+	}
+
 	// 生成私钥: 随机数 < P
 	// 等等，RFC 建议私钥长度 >= 2 * 组强度。
 	// 对于 2048 (112 位强度)，224 位就足够了。
@@ -232,6 +251,22 @@ func (dh *DiffieHellman) GenerateKey() error {
 }
 
 func (dh *DiffieHellman) ComputeSharedSecret(peerPubKeyBytes []byte) ([]byte, error) {
+	if dh.ecdhCurve != nil {
+		if dh.ecdhPrivKey == nil {
+			return nil, errors.New("ECDH 私钥未初始化")
+		}
+		peerPubKey, err := dh.ecdhCurve.NewPublicKey(peerPubKeyBytes)
+		if err != nil {
+			return nil, fmt.Errorf("无效的对端公钥: %w", err)
+		}
+		secret, err := dh.ecdhPrivKey.ECDH(peerPubKey)
+		if err != nil {
+			return nil, err
+		}
+		dh.SharedKey = append(dh.SharedKey[:0], secret...)
+		return dh.SharedKey, nil
+	}
+
 	peerPubKey := new(big.Int).SetBytes(peerPubKeyBytes)
 
 	// 验证对端密钥: 1 < peer < P-1
@@ -260,6 +295,10 @@ func (dh *DiffieHellman) ComputeSharedSecret(peerPubKeyBytes []byte) ([]byte, er
 }
 
 func (dh *DiffieHellman) PublicKeyBytes() []byte {
+	if dh.ecdhPubKey != nil {
+		return append([]byte(nil), dh.ecdhPubKey.Bytes()...)
+	}
+
 	// P 是 2048 位 (256 字节)
 	keyLen := (dh.P.BitLen() + 7) / 8
 	pubBytes := dh.PublicKey.Bytes()

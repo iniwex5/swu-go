@@ -16,6 +16,19 @@ import (
 	"github.com/iniwex5/swu-go/pkg/logger"
 )
 
+func classifyIKEProfile(encrID, integID, prfID uint16) string {
+	switch {
+	case prfID == uint16(ikev2.PRF_AES128_XCBC) || integID == uint16(ikev2.AUTH_AES_XCBC_96):
+		return "xcbc_legacy"
+	case prfID == uint16(ikev2.PRF_HMAC_SHA2_256) && integID == uint16(ikev2.AUTH_HMAC_SHA2_256_128):
+		return "sha2_modern"
+	case prfID == uint16(ikev2.PRF_HMAC_SHA1) && integID == uint16(ikev2.AUTH_HMAC_SHA1_96):
+		return "sha1_legacy"
+	default:
+		return "mixed"
+	}
+}
+
 func detectOutboundIPv4(remoteIP net.IP, remotePort uint16) (net.IP, error) {
 	if remoteIP == nil {
 		return nil, errors.New("remote ip is nil")
@@ -51,9 +64,39 @@ func (s *Session) buildIKESAInitPacket() ([]byte, error) {
 		rand.Read(s.ni)
 	}
 
-	if s.DH == nil {
-		var err error
-		s.DH, err = crypto.NewDiffieHellman(14)
+	// 使用配置驱动的 IKE Proposal；为空时回退到内置大兼容集合。
+	proposals, err := buildIKEProposals(s.cfg.IKEProposals, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if s.DH != nil {
+		// 这是重试协商的情况（e.g. 处理了 INVALID_KE_PAYLOAD）
+		// 我们必须确保 SA 载荷中包含我们实际使用的这个 DH Group
+		found := false
+		for _, p := range proposals {
+			for _, t := range p.Transforms {
+				if t.Type == ikev2.TransformTypeDH && t.ID == ikev2.AlgorithmType(s.DH.Group) {
+					found = true
+				}
+			}
+		}
+		if !found {
+			// 如果当前生成的所有 Proposal 中没有我们需要的 DH Group，
+			// 将当前所有 Proposal 中的 DH 强制替换为服务器要求的新的 DH Group
+			for _, p := range proposals {
+				for _, t := range p.Transforms {
+					if t.Type == ikev2.TransformTypeDH {
+						t.ID = ikev2.AlgorithmType(s.DH.Group)
+					}
+				}
+			}
+		}
+		prioritizeDHGroup(proposals, ikev2.AlgorithmType(s.DH.Group))
+	} else {
+		// 第一次发送，取 Proposal 里的首选 DH Group 为主
+		dhGroup := firstDHGroupFromProposals(proposals)
+		s.DH, err = crypto.NewDiffieHellman(uint16(dhGroup))
 		if err != nil {
 			return nil, err
 		}
@@ -61,9 +104,6 @@ func (s *Session) buildIKESAInitPacket() ([]byte, error) {
 			return nil, err
 		}
 	}
-
-	// 使用高兼容性的工厂方法生成 Proposal
-	proposals := ikev2.CreateMultiProposalIKE(nil)
 
 	saPayload := &ikev2.EncryptedPayloadSA{
 		Proposals: proposals,
@@ -166,6 +206,36 @@ func (s *Session) buildIKESAInitPacket() ([]byte, error) {
 	return data, nil
 }
 
+func prioritizeDHGroup(proposals []*ikev2.Proposal, preferred ikev2.AlgorithmType) {
+	for _, p := range proposals {
+		var dhs []*ikev2.Transform
+		others := make([]*ikev2.Transform, 0, len(p.Transforms))
+		for _, t := range p.Transforms {
+			if t.Type == ikev2.TransformTypeDH {
+				dhs = append(dhs, t)
+				continue
+			}
+			others = append(others, t)
+		}
+		if len(dhs) == 0 {
+			continue
+		}
+
+		orderedDHs := make([]*ikev2.Transform, 0, len(dhs))
+		for _, t := range dhs {
+			if t.ID == preferred {
+				orderedDHs = append(orderedDHs, t)
+			}
+		}
+		for _, t := range dhs {
+			if t.ID != preferred {
+				orderedDHs = append(orderedDHs, t)
+			}
+		}
+		p.Transforms = append(others, orderedDHs...)
+	}
+}
+
 func (s *Session) handleIKESAInitResp(data []byte) error {
 	packet, err := ikev2.DecodePacket(data)
 	if err != nil {
@@ -209,7 +279,7 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 			// IKE Fragmentation (RFC 7383)
 			if v.NotifyType == ikev2.IKEV2_FRAGMENTATION_SUPPORTED {
 				s.fragmentationSupported = true
-				s.Logger.Info("ePDG 支持 IKE Fragmentation")
+				s.Logger.Debug("ePDG 支持 IKE Fragmentation")
 			}
 			// 检查错误，如 NO_PROPOSAL_CHOSEN
 			if v.NotifyType == 14 { // NO_PROPOSAL_CHOSEN
@@ -344,6 +414,13 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 		logger.String("prf", ikev2.PRFToString(prfID)),
 		logger.String("dh", ikev2.DHToString(dhID)),
 	)
+	s.Logger.Info("IKE SA 协商画像",
+		logger.String("profile", classifyIKEProfile(encrID, integID, prfID)),
+		logger.String("encr", ikev2.EncrToString(encrID)),
+		logger.String("integ", ikev2.IntegToString(integID)),
+		logger.String("prf", ikev2.PRFToString(prfID)),
+		logger.String("dh", ikev2.DHToString(dhID)),
+	)
 
 	// 设置加密实例
 	s.PRFAlg, err = crypto.GetPRF(prfID)
@@ -356,6 +433,8 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 		return fmt.Errorf("选择了不支持的 Encr: %d", encrID)
 	}
 	s.ikeEncrID = encrID
+	s.ikePRFID = prfID
+	s.ikeEncrKeyLenBits = encrKeyLenBits
 	s.ikeIsAEAD = encrID == uint16(ikev2.ENCR_AES_GCM_16) || encrID == uint16(ikev2.ENCR_AES_GCM_12) || encrID == uint16(ikev2.ENCR_AES_GCM_8)
 	if s.ikeIsAEAD {
 		s.ikeIntegID = 0

@@ -33,3 +33,12 @@ func buildNAI(imsi string, cfg *Config) string {
 	mcc, mnc := effectiveMCCMNC(imsi, cfg)
 	return fmt.Sprintf("0%s@nai.epc.mnc%s.mcc%s.3gppnetwork.org", imsi, mnc, mcc)
 }
+
+func buildAKAIdentity(imsi string, cfg *Config) string {
+	switch cfg.AKAIdentityMode {
+	case "imsi_only":
+		return "0" + imsi
+	default:
+		return buildNAI(imsi, cfg)
+	}
+}

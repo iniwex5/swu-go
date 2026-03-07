@@ -1,7 +1,6 @@
 package swu
 
 import (
-	"crypto/hmac"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -117,12 +116,7 @@ func (s *Session) handleIkeSessionResumeResp(data []byte) error {
 	seedArgs = append(seedArgs, s.ni...)
 	seedArgs = append(seedArgs, s.nr...)
 
-	skeyseedMac := s.PRFAlg.Hash()
-	skeyseedMac.Write(s.resumeOldSKd)
-
-	hmacSeed := hmac.New(s.PRFAlg.Hash, s.resumeOldSKd)
-	hmacSeed.Write(seedArgs)
-	skeyseed := hmacSeed.Sum(nil)
+	skeyseed := s.PRFAlg.Compute(s.resumeOldSKd, seedArgs)
 
 	// 重建 IKE_SA Keys
 	// 利用新的 SKEYSEED 走标准的 prf+
@@ -139,7 +133,7 @@ func (s *Session) handleIkeSessionResumeResp(data []byte) error {
 	integKeyLen := s.IntegAlg.KeySize()
 	var prfKeyLen int
 
-	prfKeyLen = s.PRFAlg.Hash().Size()
+	prfKeyLen = s.PRFAlg.KeyLen()
 
 	saltLen := 0
 	if s.ikeIsAEAD {

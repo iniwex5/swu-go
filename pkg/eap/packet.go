@@ -50,14 +50,14 @@ const (
 	AT_COUNTER_TOO_SMALL = 20
 	AT_NONCE_S           = 21
 	AT_CLIENT_ERROR_CODE = 22
-	AT_CHECKCODE         = 23
-	AT_KDF_INPUT         = 23  // AKA' 专用: 网络名称输入 (RFC 5448 §3.1)，与 AT_CHECKCODE 共用编号但在 Type 50 下语义不同
+	AT_KDF_INPUT         = 23  // AKA' 专用: 网络名称输入 (RFC 5448 §3.1)，在 AKA' 中占用该编号
 	AT_KDF               = 24  // AKA' 专用: KDF 协商标识 (RFC 5448 §3.2)
 	AT_IV                = 129 // 加密向量 (RFC 4187 §10.12)
 	AT_ENCR_DATA         = 130 // 加密数据 (RFC 4187 §10.12)
 	AT_NEXT_PSEUDONYM    = 132 // 下次的临时假名
 	AT_NEXT_REAUTH_ID    = 133 // 下次的快速重认证 ID (RFC 4187 §10.15)
-	AT_RESULT_IND        = 134 // 受保护的成功指示 (RFC 4187 §10.16)
+	AT_CHECKCODE         = 134 // 完整性检查码 (RFC 4187)
+	AT_RESULT_IND        = 135 // 受保护的成功指示 (RFC 4187 §10.16)
 	AT_BIDDING           = 136 // 防止降级攻击指示 (RFC 5448 §3.3)
 )
 

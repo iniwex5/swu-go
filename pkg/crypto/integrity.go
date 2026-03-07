@@ -97,6 +97,21 @@ func (h *hmacSHA384_192) Verify(key, data, expectedMAC []byte) bool {
 func (h *hmacSHA384_192) OutputSize() int { return 24 }
 func (h *hmacSHA384_192) KeySize() int    { return 48 }
 
+// AES-XCBC-MAC-96 (RFC 3566)
+type aesXCBC96 struct{}
+
+func (h *aesXCBC96) Compute(key, data []byte) []byte {
+	return aesXCBCMAC(key, data)[:12]
+}
+
+func (h *aesXCBC96) Verify(key, data, expectedMAC []byte) bool {
+	computed := h.Compute(key, data)
+	return hmac.Equal(computed, expectedMAC)
+}
+
+func (h *aesXCBC96) OutputSize() int { return 12 }
+func (h *aesXCBC96) KeySize() int    { return 16 }
+
 // GetIntegrityAlgorithm 根据 ID 获取完整性算法
 func GetIntegrityAlgorithm(id uint16) (IntegrityAlgorithm, error) {
 	switch id {
@@ -104,6 +119,8 @@ func GetIntegrityAlgorithm(id uint16) (IntegrityAlgorithm, error) {
 		return &nullIntegrity{}, nil
 	case 2: // AUTH_HMAC_SHA1_96
 		return &hmacSHA1_96{}, nil
+	case 5: // AUTH_AES_XCBC_96
+		return &aesXCBC96{}, nil
 	case 12: // AUTH_HMAC_SHA2_256_128
 		return &hmacSHA256_128{}, nil
 	case 13: // AUTH_HMAC_SHA2_384_192

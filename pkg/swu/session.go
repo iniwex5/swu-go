@@ -49,9 +49,11 @@ type Session struct {
 
 	SequenceNumber atomic.Uint32 // IKE 消息 ID (利用原子操作支持并发挂窗)
 
-	ikeEncrID  uint16
-	ikeIntegID uint16
-	ikeIsAEAD  bool
+	ikeEncrID         uint16
+	ikePRFID          uint16
+	ikeIntegID        uint16
+	ikeIsAEAD         bool
+	ikeEncrKeyLenBits int
 
 	// Child SA 状态 (目前仅支持一对)
 	ChildSAIn  *ipsec.SecurityAssociation
@@ -148,6 +150,25 @@ type Session struct {
 	ws *WiresharkDebugger
 
 	Logger *zap.Logger
+
+	statusMu       sync.RWMutex
+	terminalErrMsg string
+}
+
+func (s *Session) setTerminalError(err error) {
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
+	s.statusMu.Lock()
+	s.terminalErrMsg = msg
+	s.statusMu.Unlock()
+}
+
+func (s *Session) terminalError() string {
+	s.statusMu.RLock()
+	defer s.statusMu.RUnlock()
+	return s.terminalErrMsg
 }
 
 type ikeWaitKey struct {
@@ -375,9 +396,20 @@ func (s *Session) connectOnce() error {
 					if err := newDH.GenerateKey(); err != nil {
 						return fmt.Errorf("DH Group %d 生成密钥失败: %v", keErr.PreferredGroup, err)
 					}
+					// 对齐手机行为：INVALID_KE 后重新生成一轮全新的 SA_INIT，
+					// 包括新的 SPIi / Nonce / DhKey，而不是在旧会话上简单重发。
+					spiBytes, spiErr := crypto.RandomBytes(8)
+					if spiErr != nil {
+						return fmt.Errorf("重新生成 SPIi 失败: %v", spiErr)
+					}
+					s.SPIi = binary.BigEndian.Uint64(spiBytes)
+					s.SPIr = 0
 					s.DH = newDH
-					// 重置 Nonce 以便重新构建包
+					// 重置握手临时材料，以便重新构建新的 SA_INIT。
 					s.ni = nil
+					s.nr = nil
+					s.msgBuffer = nil
+					s.Keys = nil
 					continue
 				}
 				return err
