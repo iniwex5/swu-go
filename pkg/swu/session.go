@@ -227,6 +227,36 @@ func NewSession(cfg *Config, l *zap.Logger) *Session {
 	}
 }
 
+func detectOutboundRoute(remoteIP net.IP) (net.IP, int, string, error) {
+	if remoteIP == nil {
+		return nil, 0, "", errors.New("remote ip is nil")
+	}
+	routes, err := netlink.RouteGet(remoteIP)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	for _, route := range routes {
+		src := route.Src
+		if src == nil || src.IsUnspecified() {
+			continue
+		}
+		if src.To4() == nil && remoteIP.To4() != nil {
+			continue
+		}
+		if src.To4() != nil && remoteIP.To4() == nil {
+			continue
+		}
+		ifaceName := ""
+		if route.LinkIndex > 0 {
+			if link, err := netlink.LinkByIndex(route.LinkIndex); err == nil && link != nil {
+				ifaceName = link.Attrs().Name
+			}
+		}
+		return src, route.LinkIndex, ifaceName, nil
+	}
+	return nil, 0, "", errors.New("no usable route source found")
+}
+
 // initFastReauthCtx 从外层 Config 恢复快速重认证上下文
 func initFastReauthCtx(cfg *Config) *eap.FastReauthContext {
 	ctx := eap.NewFastReauthContext()
@@ -1150,24 +1180,40 @@ func (s *Session) setupXFRMDataPlane() error {
 	// 2. 获取网络参数
 	var localIP, remoteIP net.IP
 	var localPort, remotePort int
+	var routeIfIndex int
+	var routeIfName string
 	if sm, ok := s.socket.(*ipsec.SocketManager); ok {
 		localIP = sm.LocalIP()
 		remoteIP = sm.RemoteIP()
 		localPort = int(sm.LocalPort())
 		remotePort = sm.RemotePort()
 
-		// 如果绑定的是 0.0.0.0，需要探测实际出口 IP 用于 SA Src
+		// 如果绑定的是 0.0.0.0，需要基于内核路由查询实际出口 IP，用于 SA Src。
+		// 不能靠额外 Dial("udp") 猜测，多网卡/bridge/vpn 环境下会选错源地址。
 		if localIP.IsUnspecified() {
-			s.Logger.Debug("LocalIP 未指定 (0.0.0.0)，尝试探测实际出口 IP", logger.String("remote", s.cfg.EpDGAddr))
-			// 使用 UDP 探测路由出口 IP
-			addr := net.JoinHostPort(s.cfg.EpDGAddr, fmt.Sprintf("%d", remotePort))
-			conn, err := net.Dial("udp", addr)
-			if err == nil {
-				localIP = conn.LocalAddr().(*net.UDPAddr).IP
-				conn.Close()
-				s.Logger.Debug("探测到实际出口 IP", logger.String("ip", localIP.String()))
+			s.Logger.Debug("LocalIP 未指定 (0.0.0.0)，尝试查询内核路由出口", logger.String("remote", s.cfg.EpDGAddr))
+			if routedIP, ifIndex, ifName, err := detectOutboundRoute(remoteIP); err == nil {
+				localIP = routedIP
+				routeIfIndex = ifIndex
+				routeIfName = ifName
+				if routeIfIndex > 0 && routeIfName != "" {
+					s.Logger.Debug("探测到实际出口 IP", logger.String("ip", localIP.String()), logger.Int("idx", routeIfIndex), logger.String("iface", routeIfName))
+				} else if routeIfIndex > 0 {
+					s.Logger.Debug("探测到实际出口 IP", logger.String("ip", localIP.String()), logger.Int("idx", routeIfIndex))
+				} else {
+					s.Logger.Debug("探测到实际出口 IP", logger.String("ip", localIP.String()))
+				}
 			} else {
-				s.Logger.Warn("探测实际出口 IP 失败，将使用 0.0.0.0 (可能导致 XFRM 封装失败)", logger.Err(err))
+				s.Logger.Warn("查询内核路由出口失败，将回退 UDP 探测 (可能受多网卡环境影响)", logger.Err(err))
+				addr := net.JoinHostPort(s.cfg.EpDGAddr, fmt.Sprintf("%d", remotePort))
+				conn, dialErr := net.Dial("udp", addr)
+				if dialErr == nil {
+					localIP = conn.LocalAddr().(*net.UDPAddr).IP
+					conn.Close()
+					s.Logger.Debug("回退 UDP 探测得到出口 IP", logger.String("ip", localIP.String()))
+				} else {
+					s.Logger.Warn("探测实际出口 IP 失败，将使用 0.0.0.0 (可能导致 XFRM 封装失败)", logger.Err(dialErr))
+				}
 			}
 		}
 	} else {
@@ -1191,7 +1237,12 @@ func (s *Session) setupXFRMDataPlane() error {
 	// 查找 Underlying Interface (物理接口)
 	// XFRMI 接口最好绑定到底层物理接口，以便内核正确关联流量，避免 TX Error
 	var underlyingIdx int
-	if localIP != nil {
+	if routeIfIndex > 0 {
+		underlyingIdx = routeIfIndex
+		if routeIfName != "" {
+			s.Logger.Debug("绑定底层物理接口", logger.String("iface", routeIfName), logger.Int("idx", routeIfIndex))
+		}
+	} else if localIP != nil {
 		if ifaces, err := net.Interfaces(); err == nil {
 			for _, iface := range ifaces {
 				if addrs, err := iface.Addrs(); err == nil {
