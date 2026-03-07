@@ -124,6 +124,11 @@ type Session struct {
 	lastEncryptedMsg   []byte
 	lastEncryptedMsgID uint32
 
+	// RFC 4187 AT_CHECKCODE: 累积 EAP-AKA Identity 往返报文，供 Challenge 阶段计算校验码。
+	akaIdentityTranscript [][]byte
+	ikeIdentity           string
+	eapIdentity           string
+
 	// COOKIE 处理
 	cookie     []byte // ePDG 返回的 COOKIE
 	sendCookie bool   // 标记是否需要发送 COOKIE

@@ -18,6 +18,55 @@ import (
 	"github.com/iniwex5/swu-go/pkg/sim"
 )
 
+func cloneBytes(b []byte) []byte {
+	if len(b) == 0 {
+		return nil
+	}
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out
+}
+
+func (s *Session) appendAKAIdentityTranscript(pkt []byte) {
+	if len(pkt) == 0 {
+		return
+	}
+	s.akaIdentityTranscript = append(s.akaIdentityTranscript, cloneBytes(pkt))
+}
+
+func (s *Session) buildAKACheckcodeValue() []byte {
+	sum := sha1.New()
+	for _, pkt := range s.akaIdentityTranscript {
+		sum.Write(pkt)
+	}
+	checkcode := sum.Sum(nil)
+	value := make([]byte, 2+len(checkcode))
+	copy(value[2:], checkcode)
+	return value
+}
+
+func (s *Session) currentIKEIdentity() string {
+	if s.ikeIdentity != "" {
+		return s.ikeIdentity
+	}
+	if s.cfg.FastReauthID != "" {
+		return s.cfg.FastReauthID
+	}
+	imsi, _ := s.cfg.SIM.GetIMSI()
+	return buildIKEIdentity(imsi, s.cfg)
+}
+
+func (s *Session) currentEAPIdentity() string {
+	if s.eapIdentity != "" {
+		return s.eapIdentity
+	}
+	if s.cfg.FastReauthID != "" {
+		return s.cfg.FastReauthID
+	}
+	imsi, _ := s.cfg.SIM.GetIMSI()
+	return buildAKAIdentity(imsi, s.cfg)
+}
+
 func (s *Session) buildIKEAuthInitPayloads() ([]ikev2.Payload, error) {
 	// 载荷: IDi, SA, TS, TS, N(EAP_ONLY)
 
@@ -31,8 +80,9 @@ func (s *Session) buildIKEAuthInitPayloads() ([]ikev2.Payload, error) {
 		if err != nil {
 			return nil, err
 		}
-		nai = buildAKAIdentity(imsi, s.cfg)
+		nai = buildIKEIdentity(imsi, s.cfg)
 	}
+	s.ikeIdentity = nai
 	idPayload := &ikev2.EncryptedPayloadID{
 		IDType:      ikev2.ID_RFC822_ADDR,
 		IDData:      []byte(nai),
@@ -276,6 +326,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 			imsi, _ := s.cfg.SIM.GetIMSI()
 			identity = buildAKAIdentity(imsi, s.cfg)
 		}
+		s.eapIdentity = identity
 
 		respPkt := &eap.EAPPacket{
 			Code:       eap.CodeResponse,
@@ -315,7 +366,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		// 通常回复完整 NAI 也是可以的，但部分严格网卡只认 "0" + IMSI。
 		// 还有一点：如果在 Identity 请求包含了 AT_ANY_ID_REQ，设备也可自行返回假名。
 		// 不过这里保守起见，保持和初始 IKE_AUTH 中的 IDi 相同，即完整的 NAI：
-		nai := buildAKAIdentity(imsi, s.cfg)
+		nai := buildAKAIdentityForEAPType(imsi, s.cfg, pkt.Type)
 
 		// 检查 ePDG 是否请求了明文 IMSI (AT_PERMANENT_ID_REQ = 10) 或 AT_ANY_ID_REQ = 13
 		_, hasPermReq := attrs[eap.AT_PERMANENT_ID_REQ]
@@ -325,9 +376,10 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 			// RFC 4187 要求返回 Permanent Identity (或者伪装名，这里我们总是出示真实 Permanent Identity)
 			// 根据 3GPP TS 23.003 §19.3.2，EAP-AKA 的 Permanent Identity 必须遵循 NAI 格式: "0" + IMSI + "@nai.epc.mncXXX.mccYYY.3gppnetwork.org"
 			// 也就是说它依然带有 @ 域名后缀。我们直接使用 buildNAI 即可。
-			nai = buildAKAIdentity(imsi, s.cfg)
+			nai = buildAKAIdentityForEAPType(imsi, s.cfg, pkt.Type)
 			s.Logger.Info("服务器要求出示 Identity，提供包含 Realm 的 3GPP Permanent NAI", logger.String("permanent_id", nai))
 		}
+		s.eapIdentity = nai
 
 		// RFC 4187 §10.7: AT_IDENTITY Value = ActualLength(2 bytes) + Identity
 		naiBytes := []byte(nai)
@@ -361,6 +413,8 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		}
 
 		encodedResp := respPkt.Encode()
+		s.appendAKAIdentityTranscript(eapRaw)
+		s.appendAKAIdentityTranscript(encodedResp)
 		s.Logger.Debug("已构造 EAP Identity Response",
 			logger.String("identity", nai),
 			logger.Bool("with_any_id_req", hasAnyIdReq),
@@ -424,7 +478,8 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		s.Logger.Debug("Received EAP-AKA Challenge attributes", logger.Any("keys", keys))
 
 		// Challenge 可选协商属性：AT_BIDDING / AT_CHECKCODE / AT_RESULT_IND
-		// 对齐安卓成功抓包与 strongSwan peer 行为：
+		// RFC 5448 的 AT_BIDDING 是服务器下发的协商/防降级指示，不应在
+		// EAP-Response/AKA-Challenge 中回显。这里最多只回显 AT_CHECKCODE。
 		// EAP-AKA Response/Challenge 默认仅发送 AT_RES + AT_MAC。
 		mode := s.cfg.AKAChallengeMode
 		if mode == "" {
@@ -480,8 +535,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 			}
 			return nil, fmt.Errorf("SIM AKA failed: %v", err)
 		}
-		imsi, _ := s.cfg.SIM.GetIMSI()
-		identity := []byte(buildAKAIdentity(imsi, s.cfg))
+		identity := []byte(s.currentEAPIdentity())
 		s.Logger.Debug("AKA 密码材料计算原始材料",
 			logger.String("identity", string(identity)),
 			logger.String("ik_hex", fmt.Sprintf("%x", ik)),
@@ -560,40 +614,34 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 			}
 		case "force_bidding_aka":
 			if hasBidding {
-				respAttrs = append(respAttrs, (&eap.Attribute{
-					Type:  eap.AT_BIDDING,
-					Value: []byte{0x80, 0x00}, // 恢复正确的 Length=1 载荷
-				}).Encode()...)
+				s.Logger.Info("AT_BIDDING 仅作协商提示处理，EAP-AKA Response 中不回显",
+					logger.String("aka_challenge_mode", mode))
 			}
 			if hasCheckcode {
+				checkcodeValue := s.buildAKACheckcodeValue()
 				respAttrs = append(respAttrs, (&eap.Attribute{
 					Type:  eap.AT_CHECKCODE,
-					Value: append([]byte(nil), atCheckcode.Value...),
+					Value: checkcodeValue,
 				}).Encode()...)
-				s.Logger.Info("AT_CHECKCODE 原样回显", logger.String("value", eapAttrDigest(atCheckcode.Value)))
+				s.Logger.Info("AT_CHECKCODE 已按 RFC 4187 重新计算",
+					logger.String("value", eapAttrDigest(checkcodeValue)))
 			}
 			if hasResultInd {
 				s.Logger.Info("收到 AT_RESULT_IND（EAP-AKA 下不回显）")
 			}
 		default: // "echo"
 			if hasBidding {
-				val := []byte{0x00, 0x00}
-				if len(atBidding.Value) >= 2 {
-					val[0], val[1] = atBidding.Value[0], atBidding.Value[1]
-				}
-				s.Logger.Info("AT_BIDDING 严格原样回显",
-					logger.String("value", fmt.Sprintf("%02x%02x", val[0], val[1])))
-				respAttrs = append(respAttrs, (&eap.Attribute{
-					Type:  eap.AT_BIDDING,
-					Value: val,
-				}).Encode()...)
+				s.Logger.Info("AT_BIDDING 仅作协商提示处理，EAP-AKA Response 中不回显",
+					logger.String("aka_challenge_mode", mode))
 			}
 			if hasCheckcode {
+				checkcodeValue := s.buildAKACheckcodeValue()
 				respAttrs = append(respAttrs, (&eap.Attribute{
 					Type:  eap.AT_CHECKCODE,
-					Value: append([]byte(nil), atCheckcode.Value...),
+					Value: checkcodeValue,
 				}).Encode()...)
-				s.Logger.Info("AT_CHECKCODE 原样回显", logger.String("value", eapAttrDigest(atCheckcode.Value)))
+				s.Logger.Info("AT_CHECKCODE 已按 RFC 4187 重新计算",
+					logger.String("value", eapAttrDigest(checkcodeValue)))
 			}
 			if hasResultInd {
 				s.Logger.Info("收到 AT_RESULT_IND（EAP-AKA 下不回显）")
@@ -651,8 +699,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 					logger.String("reauthID", reauthID))
 
 				// 派生加密密钥 K_encr (MK 的前 16 字节)
-				imsi, _ := s.cfg.SIM.GetIMSI()
-				identity := []byte(buildAKAIdentity(imsi, s.cfg))
+				identity := []byte(s.currentEAPIdentity())
 				h := sha1.New()
 				h.Write(identity)
 				h.Write(ik)
@@ -773,8 +820,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		ikPrime := kdfResult[16:32]
 
 		// RFC 5448 §3.4: MK = SHA-256(Identity|IK'|CK')
-		imsi, _ := s.cfg.SIM.GetIMSI()
-		identity := []byte(buildAKAIdentity(imsi, s.cfg))
+		identity := []byte(s.currentEAPIdentity())
 
 		mkHash := sha256.New()
 		mkHash.Write(identity)
@@ -1144,8 +1190,7 @@ func (s *Session) buildIKEAuthFinalPayloads() ([]ikev2.Payload, error) {
 
 	// 2c. prf(SK_pi, IDi_Body)
 	// 重建 IDi Body
-	imsi, _ := s.cfg.SIM.GetIMSI()
-	nai := buildAKAIdentity(imsi, s.cfg)
+	nai := s.currentIKEIdentity()
 
 	// ID 载荷主体: IDType(1 byte) + Reserved(3 bytes) + IDData
 	// IDType = ID_RFC822_ADDR (3)

@@ -45,8 +45,10 @@ type Config struct {
 	// 默认 false：遵循标准终端行为，避免触发运营商风控拒绝。
 	EnableDeviceIdentitySpoof bool
 	DeviceIdentityIMEI        string
+	IKEIdentityMode           string
 	AKAChallengeMode          string
 	AKAIdentityMode           string
+	AKAPrimePreferred         bool
 
 	EnableWiresharkKeyLog bool
 	WiresharkKeyLogPath   string
