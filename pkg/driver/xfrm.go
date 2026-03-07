@@ -203,7 +203,7 @@ func (x *XFRMManager) AddSA(cfg XFRMSAConfig) error {
 		}
 	}
 
-	if err := netlink.XfrmStateAdd(state); err != nil {
+	if err := x.addStateCompat(state); err != nil {
 		return fmt.Errorf("添加 XFRM SA (spi=0x%x src=%v dst=%v) 失败: %v",
 			cfg.SPI, cfg.Src, cfg.Dst, err)
 	}
@@ -213,6 +213,41 @@ func (x *XFRMManager) AddSA(cfg XFRMSAConfig) error {
 	})
 
 	return nil
+}
+
+func (x *XFRMManager) addStateCompat(state *netlink.XfrmState) error {
+	if err := netlink.XfrmStateAdd(state); err == nil {
+		return nil
+	} else if !errors.Is(err, syscall.EINVAL) {
+		return err
+	} else {
+		var attempts []*netlink.XfrmState
+		if state.SADir != 0 {
+			s := *state
+			s.SADir = 0
+			attempts = append(attempts, &s)
+		}
+		if state.AFUnspec {
+			s := *state
+			s.AFUnspec = false
+			attempts = append(attempts, &s)
+		}
+		if state.SADir != 0 && state.AFUnspec {
+			s := *state
+			s.SADir = 0
+			s.AFUnspec = false
+			attempts = append(attempts, &s)
+		}
+		lastErr := err
+		for _, attempt := range attempts {
+			if retryErr := netlink.XfrmStateAdd(attempt); retryErr == nil {
+				return nil
+			} else {
+				lastErr = retryErr
+			}
+		}
+		return lastErr
+	}
 }
 
 // DelSA 删除 XFRM SA（幂等：SA 不存在时静默返回 nil）
