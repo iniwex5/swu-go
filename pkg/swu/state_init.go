@@ -369,15 +369,19 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 		expNatSrc := ikev2.CalculateNATDetectionHash(s.SPIi, s.SPIr, localIP, localPort)
 		expNatDst := ikev2.CalculateNATDetectionHash(s.SPIi, s.SPIr, remoteIP, remotePort)
 
-		natDetected := !bytes.Equal(natSrc, expNatSrc) || !bytes.Equal(natDst, expNatDst)
-		if natDetected {
-			if setter, ok := s.socket.(interface{ SetRemotePort(int) }); ok {
-				setter.SetRemotePort(4500)
+			natDetected := !bytes.Equal(natSrc, expNatSrc) || !bytes.Equal(natDst, expNatDst)
+			if natDetected {
+				if setter, ok := s.socket.(interface{ SetRemotePort(int) }); ok {
+					setter.SetRemotePort(4500)
+				}
+				natKeepalive := s.cfg.NATKeepaliveSeconds
+				if natKeepalive <= 0 {
+					natKeepalive = 20
+				}
+				s.startNATKeepalive(time.Duration(natKeepalive) * time.Second)
+				s.Logger.Debug("检测到 NAT，切换到 UDP 4500")
 			}
-			s.startNATKeepalive(20 * time.Second)
-			s.Logger.Debug("检测到 NAT，切换到 UDP 4500")
 		}
-	}
 
 	// 处理 SA 选择 (简化: 假设服务器接受了我们的提议)
 	// 我们应该解析 `saPayload.Proposals[0]` 以查看选择了什么。

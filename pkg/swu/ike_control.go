@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/iniwex5/swu-go/pkg/crypto"
+	"github.com/iniwex5/swu-go/pkg/driver"
 	"github.com/iniwex5/swu-go/pkg/ikev2"
 	"github.com/iniwex5/swu-go/pkg/ipsec"
 	"github.com/iniwex5/swu-go/pkg/logger"
@@ -400,6 +401,8 @@ func (s *Session) handleIncomingCreateChildSAParsed(msgID uint32, payloads []ike
 	ourSPI := binary.BigEndian.Uint32(spiBytes)
 
 	var encrKeyLenBits int
+	var integID uint16
+	var useESN bool
 	for _, t := range reqSA.Proposals[0].Transforms {
 		if t.Type == ikev2.TransformTypeEncr {
 			for _, a := range t.Attributes {
@@ -407,6 +410,14 @@ func (s *Session) handleIncomingCreateChildSAParsed(msgID uint32, payloads []ike
 					encrKeyLenBits = int(a.Val)
 				}
 			}
+			continue
+		}
+		if t.Type == ikev2.TransformTypeInteg {
+			integID = uint16(t.ID)
+			continue
+		}
+		if t.Type == ikev2.TransformTypeESN && t.ID == 1 {
+			useESN = true
 		}
 	}
 	childEnc, err := crypto.GetEncrypterWithKeyLen(encrID, encrKeyLenBits)
@@ -483,8 +494,15 @@ func (s *Session) handleIncomingCreateChildSAParsed(msgID uint32, payloads []ike
 	}
 
 	respProp := ikev2.NewProposal(1, ikev2.ProtoESP, spiBytes)
-	respProp.AddTransform(ikev2.TransformTypeEncr, ikev2.AlgorithmType(encrID), 128)
-	respProp.AddTransform(ikev2.TransformTypeESN, 0, 0)
+	respProp.AddTransformWithKeyLen(ikev2.TransformTypeEncr, ikev2.AlgorithmType(encrID), encrKeyLenBits)
+	if !driver.IsAEADAlgorithm(encrID) && integID != 0 {
+		respProp.AddTransform(ikev2.TransformTypeInteg, ikev2.AlgorithmType(integID), 0)
+	}
+	if useESN {
+		respProp.AddTransform(ikev2.TransformTypeESN, 1, 0)
+	} else {
+		respProp.AddTransform(ikev2.TransformTypeESN, 0, 0)
+	}
 	respSA := &ikev2.EncryptedPayloadSA{Proposals: []*ikev2.Proposal{respProp}}
 
 	respNonce := &ikev2.EncryptedPayloadNonce{NonceData: nr}

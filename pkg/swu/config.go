@@ -49,6 +49,8 @@ type Config struct {
 	AKAChallengeMode          string
 	AKAIdentityMode           string
 	AKAPrimePreferred         bool
+	NATKeepaliveSeconds       int
+	DPDIntervalSeconds        int
 
 	EnableWiresharkKeyLog bool
 	WiresharkKeyLogPath   string

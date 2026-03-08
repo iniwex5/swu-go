@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/iniwex5/swu-go/pkg/crypto"
+	"github.com/iniwex5/swu-go/pkg/driver"
 	"github.com/iniwex5/swu-go/pkg/ikev2"
 	"github.com/iniwex5/swu-go/pkg/ipsec"
 	"github.com/iniwex5/swu-go/pkg/logger"
@@ -45,30 +46,55 @@ func (s *Session) RekeyChildSA() error {
 	}
 	newSPIValue := binary.BigEndian.Uint32(newSPI)
 
-	// 3. 构造 SA 载荷（与 IKE_AUTH 时一致，提供 CBC 和 GCM 两个选择）
-	propCBC := ikev2.NewProposal(1, ikev2.ProtoESP, newSPI)
-	propCBC.AddTransformWithKeyLen(ikev2.TransformTypeEncr, ikev2.ENCR_AES_CBC, 128)
-	propCBC.AddTransform(ikev2.TransformTypeInteg, ikev2.AUTH_HMAC_SHA2_256_128, 0)
-	if s.cfg.EnableESN {
-		propCBC.AddTransform(ikev2.TransformTypeESN, 1, 0) // ESN
+	// 3. 构造 SA 载荷。RFC 7296 要求 rekey 出来的 Child SA 应与旧 SA 等价，
+	// 因此这里沿用当前已协商的 ESP 算法/密钥长度/ESN，而不是重新发一组“更大兼容集”。
+	if s.childEncrID == 0 {
+		return errors.New("当前 Child SA 算法未知，无法 Rekey")
 	}
-	propCBC.AddTransform(ikev2.TransformTypeESN, 0, 0) // NO_ESN (fallback)
-
-	propGCM := ikev2.NewProposal(2, ikev2.ProtoESP, newSPI)
-	propGCM.AddTransformWithKeyLen(ikev2.TransformTypeEncr, ikev2.ENCR_AES_GCM_16, 128)
-	if s.cfg.EnableESN {
-		propGCM.AddTransform(ikev2.TransformTypeESN, 1, 0) // ESN
+	prop := ikev2.NewProposal(1, ikev2.ProtoESP, newSPI)
+	encrKeyLenBits := s.childEncrKeyLenBits
+	if encrKeyLenBits == 0 {
+		childEnc, err := crypto.GetEncrypterWithKeyLen(s.childEncrID, 0)
+		if err != nil {
+			return fmt.Errorf("无法确定 Child SA 密钥长度: %v", err)
+		}
+		encrKeyLenBits = childEnc.KeySize() * 8
 	}
-	propGCM.AddTransform(ikev2.TransformTypeESN, 0, 0) // NO_ESN (fallback)
-
-	saPayload := &ikev2.EncryptedPayloadSA{
-		Proposals: []*ikev2.Proposal{propCBC, propGCM},
+	prop.AddTransformWithKeyLen(ikev2.TransformTypeEncr, ikev2.AlgorithmType(s.childEncrID), encrKeyLenBits)
+	if !driver.IsAEADAlgorithm(s.childEncrID) {
+		if s.childIntegID == 0 {
+			return errors.New("当前 Child SA 完整性算法未知，无法 Rekey")
+		}
+		prop.AddTransform(ikev2.TransformTypeInteg, ikev2.AlgorithmType(s.childIntegID), 0)
 	}
+	if s.childESN {
+		prop.AddTransform(ikev2.TransformTypeESN, 1, 0)
+	} else {
+		prop.AddTransform(ikev2.TransformTypeESN, 0, 0)
+	}
+	saPayload := &ikev2.EncryptedPayloadSA{Proposals: []*ikev2.Proposal{prop}}
 
 	// 4. Nonce 载荷
 	noncePayload := &ikev2.EncryptedPayloadNonce{NonceData: newNonce}
 
-	// 5. REKEY_SA Notify (告知要 Rekey 哪个 SA)
+	// 5. 若旧 Child SA 使用了 PFS，Rekey 时也必须携带新的 KE。
+	var newChildDH *crypto.DiffieHellman
+	var kePayload *ikev2.EncryptedPayloadKE
+	if s.childDH != nil && s.childDH.Group != 0 {
+		newChildDH, err = crypto.NewDiffieHellman(s.childDH.Group)
+		if err != nil {
+			return fmt.Errorf("创建 Child SA Rekey DH 失败: %v", err)
+		}
+		if err := newChildDH.GenerateKey(); err != nil {
+			return fmt.Errorf("生成 Child SA Rekey DH 密钥失败: %v", err)
+		}
+		kePayload = &ikev2.EncryptedPayloadKE{
+			DHGroup: ikev2.AlgorithmType(newChildDH.Group),
+			KEData:  newChildDH.PublicKeyBytes(),
+		}
+	}
+
+	// 6. REKEY_SA Notify (告知要 Rekey 哪个 SA)
 	oldSPIBytes := make([]byte, 4)
 	binary.BigEndian.PutUint32(oldSPIBytes, s.ChildSAOut.SPI)
 	rekeyNotify := &ikev2.EncryptedPayloadNotify{
@@ -77,7 +103,7 @@ func (s *Session) RekeyChildSA() error {
 		NotifyType: ikev2.REKEY_SA,
 	}
 
-	// 6. TSi / TSr (保持不变，使用全流量)
+	// 7. TSi / TSr (保持不变，使用全流量)
 	tsi := s.tsi
 	tsr := s.tsr
 	if len(tsi) == 0 || len(tsr) == 0 {
@@ -91,19 +117,23 @@ func (s *Session) RekeyChildSA() error {
 	tsPayloadI := &ikev2.EncryptedPayloadTS{IsInitiator: true, TrafficSelectors: tsi}
 	tsPayloadR := &ikev2.EncryptedPayloadTS{IsInitiator: false, TrafficSelectors: tsr}
 
-	// 7. 构造并发送 CREATE_CHILD_SA 请求
-	payloads := []ikev2.Payload{saPayload, noncePayload, rekeyNotify, tsPayloadI, tsPayloadR}
+	// 8. 构造并发送 CREATE_CHILD_SA 请求
+	payloads := []ikev2.Payload{saPayload, noncePayload}
+	if kePayload != nil {
+		payloads = append(payloads, kePayload)
+	}
+	payloads = append(payloads, rekeyNotify, tsPayloadI, tsPayloadR)
 	respData, err := s.sendEncryptedWithRetry(payloads, ikev2.CREATE_CHILD_SA)
 	if err != nil {
 		return fmt.Errorf("CREATE_CHILD_SA 失败: %v", err)
 	}
 
 	s.Logger.Info("Rekey 收到 ePDG 响应", logger.Int("len", len(respData)))
-	return s.handleCreateChildSAResp(respData, newNonce, newSPIValue)
+	return s.handleCreateChildSAResp(respData, newNonce, newSPIValue, newChildDH)
 }
 
 // handleCreateChildSAResp 处理 CREATE_CHILD_SA 响应
-func (s *Session) handleCreateChildSAResp(data []byte, niNonce []byte, newSPI uint32) error {
+func (s *Session) handleCreateChildSAResp(data []byte, niNonce []byte, newSPI uint32, newChildDH *crypto.DiffieHellman) error {
 	s.Logger.Debug("开始解密 Rekey 响应", logger.Int("dataLen", len(data)))
 	_, payloads, err := s.decryptAndParse(data)
 	if err != nil {
@@ -121,6 +151,7 @@ func (s *Session) handleCreateChildSAResp(data []byte, niNonce []byte, newSPI ui
 	var respSA *ikev2.EncryptedPayloadSA
 	var respNonce []byte
 	var respSPI uint32
+	var respKE []byte
 	var encrID uint16
 	var integID uint16
 	var encrKeyLenBits int
@@ -149,6 +180,8 @@ func (s *Session) handleCreateChildSAResp(data []byte, niNonce []byte, newSPI ui
 			}
 		case *ikev2.EncryptedPayloadNonce:
 			respNonce = p.NonceData
+		case *ikev2.EncryptedPayloadKE:
+			respKE = p.KEData
 		case *ikev2.EncryptedPayloadNotify:
 			if p.NotifyType < 16384 { // 错误通知
 				return fmt.Errorf("CREATE_CHILD_SA 被拒绝，通知类型: %d", p.NotifyType)
@@ -189,6 +222,15 @@ func (s *Session) handleCreateChildSAResp(data []byte, niNonce []byte, newSPI ui
 	seed := make([]byte, 0, len(niNonce)+len(respNonce))
 	seed = append(seed, niNonce...)
 	seed = append(seed, respNonce...)
+	if newChildDH != nil && newChildDH.Group != 0 {
+		if len(respKE) == 0 {
+			return errors.New("CREATE_CHILD_SA 响应缺少 KE 载荷")
+		}
+		if _, err := newChildDH.ComputeSharedSecret(respKE); err != nil {
+			return fmt.Errorf("CREATE_CHILD_SA DH 计算失败: %v", err)
+		}
+		seed = append(seed, newChildDH.SharedKey...)
+	}
 
 	keyMat, err := crypto.PrfPlus(s.PRFAlg, s.Keys.SK_d, seed, keyMatLen)
 	if err != nil {
@@ -231,6 +273,9 @@ func (s *Session) handleCreateChildSAResp(data []byte, niNonce []byte, newSPI ui
 	oldInSPI := s.ChildSAIn.SPI
 	s.ChildSAOut = newSAOut
 	s.ChildSAIn = newSAIn
+	if newChildDH != nil {
+		s.childDH = newChildDH
+	}
 	if s.ChildSAsIn != nil {
 		s.ChildSAsIn[newSPI] = newSAIn
 	}

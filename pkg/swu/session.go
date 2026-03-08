@@ -612,6 +612,10 @@ func (s *Session) connectOnce() error {
 
 	s.startIKEControlLoop()
 
+	if s.cfg.DPDIntervalSeconds > 0 {
+		s.StartDPD(time.Duration(s.cfg.DPDIntervalSeconds) * time.Second)
+	}
+
 	// 计算 Rekey 间隔：如果 ePDG 通告了 AUTH_LIFETIME，动态调整
 	ikeInterval := time.Duration(ikeRekeyInterval) * time.Second
 	childInterval := time.Duration(childRekeyInterval) * time.Second
