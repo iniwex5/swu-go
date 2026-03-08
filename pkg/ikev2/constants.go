@@ -122,8 +122,8 @@ const (
 	MODP_4096_bit AlgorithmType = 16
 	MODP_6144_bit AlgorithmType = 17
 	MODP_8192_bit AlgorithmType = 18
-	ECP_256_bit  AlgorithmType = 19
-	ECP_384_bit  AlgorithmType = 20
+	ECP_256_bit   AlgorithmType = 19
+	ECP_384_bit   AlgorithmType = 20
 )
 
 // 属性类型
@@ -148,8 +148,16 @@ const (
 	FAILED_CP_REQUIRED           uint16 = 37
 	TS_UNACCEPTABLE              uint16 = 38
 	INVALID_SELECTORS            uint16 = 39
+	UNACCEPTABLE_ADDRESSES       uint16 = 40 // RFC 4555
+	UNEXPECTED_NAT_DETECTED      uint16 = 41 // RFC 4555
+	USE_ASSIGNED_HoA             uint16 = 42 // RFC 5026
 	TEMPORARY_FAILURE            uint16 = 43
 	CHILD_SA_NOT_FOUND           uint16 = 44
+	INVALID_GROUP_ID             uint16 = 45 // RFC 9838
+	AUTHORIZATION_FAILED         uint16 = 46 // RFC 9838
+	STATE_NOT_FOUND              uint16 = 47 // RFC 9370
+	TS_MAX_QUEUE                 uint16 = 48 // RFC 9611
+	REGISTRATION_FAILED          uint16 = 49 // RFC 9838
 )
 
 // 通知消息类型 - 状态类型
@@ -166,6 +174,7 @@ const (
 	REKEY_SA                      uint16 = 16393
 	ESP_TFC_PADDING_NOT_SUPPORTED uint16 = 16394
 	NON_FIRST_FRAGMENTS_ALSO      uint16 = 16395
+
 	// MOBIKE (RFC 4555) — 按 IANA IKEv2 Parameters Registry 排列
 	MOBIKE_SUPPORTED        uint16 = 16396 // RFC 4555: 移动性支持能力协商
 	ADDITIONAL_IP4_ADDRESS  uint16 = 16397 // RFC 4555: 备用 IPv4 地址
@@ -189,13 +198,43 @@ const (
 
 	EAP_ONLY_AUTHENTICATION uint16 = 16417 // RFC 5998: 仅 EAP 认证
 
-	IKEV2_MESSAGE_ID_SYNC uint16 = 16422 // RFC 6311: 消息 ID 同步
+	IKEV2_MESSAGE_ID_SYNC_SUPPORTED     uint16 = 16420 // RFC 6311
+	IPSEC_REPLAY_COUNTER_SYNC_SUPPORTED uint16 = 16421 // RFC 6311
+	IKEV2_MESSAGE_ID_SYNC               uint16 = 16422 // RFC 6311: 消息 ID 同步
+	IPSEC_REPLAY_COUNTER_SYNC           uint16 = 16423 // RFC 6311
+
+	SECURE_PASSWORD_METHODS uint16 = 16424 // RFC 6467
+	PSK_PERSIST             uint16 = 16425 // RFC 6631
+	PSK_CONFIRM             uint16 = 16426 // RFC 6631
+	ERX_SUPPORTED           uint16 = 16427 // RFC 6867
+	IFOM_CAPABILITY         uint16 = 16428 // 3GPP TS 24.303 v10.6.0 annex B.2
+	GROUP_SENDER            uint16 = 16429 // RFC 9838
 
 	// IKE Fragmentation (RFC 7383)
 	IKEV2_FRAGMENTATION_SUPPORTED uint16 = 16430
 
+	SIGNATURE_HASH_ALGORITHMS       uint16 = 16431 // RFC 7427: Signature Hash Algorithms
+	CLONE_IKE_SA_SUPPORTED          uint16 = 16432 // RFC 7791
+	CLONE_IKE_SA                    uint16 = 16433 // RFC 7791
+	PUZZLE                          uint16 = 16434 // RFC 8019
+	USE_PPK                         uint16 = 16435 // RFC 8784
+	PPK_IDENTITY                    uint16 = 16436 // RFC 8784
+	NO_PPK_AUTH                     uint16 = 16437 // RFC 8784
+	INTERMEDIATE_EXCHANGE_SUPPORTED uint16 = 16438 // RFC 9242
+	IP4_ALLOWED                     uint16 = 16439 // RFC 8983
+	IP6_ALLOWED                     uint16 = 16440 // RFC 8983
+	ADDITIONAL_KEY_EXCHANGE         uint16 = 16441 // RFC 9370
+	USE_AGGFRAG                     uint16 = 16442 // RFC 9347
+	SUPPORTED_AUTH_METHODS          uint16 = 16443 // RFC 9593
+	SA_RESOURCE_INFO                uint16 = 16444 // RFC 9611
+	USE_PPK_INT                     uint16 = 16445 // RFC 9867
+	PPK_IDENTITY_KEY                uint16 = 16446 // RFC 9867
+
 	DEVICE_IDENTITY      uint16 = 16432 // 3GPP TS 24.302: 设备身份
 	DEVICE_IDENTITY_3GPP uint16 = 41101 // 3GPP 私有: 设备身份（IMEI）
+
+	N3GPP_GENERIC_ERROR   uint16 = 40960 // 3GPP Generic Error
+	N3GPP_NETWORK_FAILURE uint16 = 41042 // EPS 10 网关或者基站等问题故障
 )
 
 // RFC 5685 Redirect Gateway Identity Type

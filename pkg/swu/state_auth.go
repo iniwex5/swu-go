@@ -603,49 +603,19 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		atRes := &eap.Attribute{Type: eap.AT_RES, Value: resValue}
 		respAttrs = append(respAttrs, atRes.Encode()...)
 
-		switch mode {
-		case "minimal":
-			if hasBidding || hasCheckcode || hasResultInd {
-				s.Logger.Info("EAP-AKA 响应将忽略可选协商属性，仅发送 AT_RES+AT_MAC",
-					logger.String("aka_challenge_mode", mode),
-					logger.Bool("has_at_bidding", hasBidding),
-					logger.Bool("has_at_checkcode", hasCheckcode),
-					logger.Bool("has_at_result_ind", hasResultInd))
-			}
-		case "force_bidding_aka":
-			if hasBidding {
-				s.Logger.Info("AT_BIDDING 仅作协商提示处理，EAP-AKA Response 中不回显",
-					logger.String("aka_challenge_mode", mode))
-			}
-			if hasCheckcode {
-				checkcodeValue := s.buildAKACheckcodeValue()
-				respAttrs = append(respAttrs, (&eap.Attribute{
-					Type:  eap.AT_CHECKCODE,
-					Value: checkcodeValue,
-				}).Encode()...)
-				s.Logger.Info("AT_CHECKCODE 已按 RFC 4187 重新计算",
-					logger.String("value", eapAttrDigest(checkcodeValue)))
-			}
-			if hasResultInd {
-				s.Logger.Info("收到 AT_RESULT_IND（EAP-AKA 下不回显）")
-			}
-		default: // "echo"
-			if hasBidding {
-				s.Logger.Info("AT_BIDDING 仅作协商提示处理，EAP-AKA Response 中不回显",
-					logger.String("aka_challenge_mode", mode))
-			}
-			if hasCheckcode {
-				checkcodeValue := s.buildAKACheckcodeValue()
-				respAttrs = append(respAttrs, (&eap.Attribute{
-					Type:  eap.AT_CHECKCODE,
-					Value: checkcodeValue,
-				}).Encode()...)
-				s.Logger.Info("AT_CHECKCODE 已按 RFC 4187 重新计算",
-					logger.String("value", eapAttrDigest(checkcodeValue)))
-			}
-			if hasResultInd {
-				s.Logger.Info("收到 AT_RESULT_IND（EAP-AKA 下不回显）")
-			}
+		// 彻底关闭 4G AKA (Type 23) 下的任何可选属性回显。
+		// RFC 4187: 在 EAP-AKA Challenge 的成功响应中，客户端唯有 AT_RES 和 AT_MAC 是合法/必需的。
+		// 多余的 AT_CHECKCODE 或 AT_BIDDING 会直接被严苛的遗留 ePDG（如 228-02）视为 Invalid Formatting 直接予以 04020004 踢离。
+		if hasBidding {
+			s.Logger.Info("收到下发 AT_BIDDING 仅作指引，遵循 4G AKA 原教旨原则不予回显",
+				logger.String("aka_challenge_mode", mode))
+		}
+		if hasCheckcode {
+			s.Logger.Info("收到下发 AT_CHECKCODE 仅作废弃警告，遵循 4G AKA 原教旨原则坚决不予回显",
+				logger.String("aka_challenge_mode", mode))
+		}
+		if hasResultInd {
+			s.Logger.Info("收到下发 AT_RESULT_IND 仅作指引，4G AKA Response 中不回显")
 		}
 
 		// AT_MAC
@@ -821,6 +791,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 
 		// RFC 5448 §3.4: MK = SHA-256(Identity|IK'|CK')
 		identity := []byte(s.currentEAPIdentity())
+		s.Logger.Debug("AKA' MK 强关联身份", logger.String("identity_used_for_mk", string(identity)))
 
 		mkHash := sha256.New()
 		mkHash.Write(identity)
