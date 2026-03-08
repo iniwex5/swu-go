@@ -53,6 +53,7 @@ type TaskManager struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	config *RetryConfig
+	device string
 
 	windowSize int
 	pending    map[uint32]*OutgoingMessage // 正在窗口内飞行的请求
@@ -64,7 +65,7 @@ type TaskManager struct {
 	sendFunc func([][]byte) error // 回拨底层的发包接口
 }
 
-func NewTaskManager(ctx context.Context, config *RetryConfig, winSize int, sendFunc func([][]byte) error) *TaskManager {
+func NewTaskManager(ctx context.Context, device string, config *RetryConfig, winSize int, sendFunc func([][]byte) error) *TaskManager {
 	if config == nil {
 		config = DefaultRetryConfig()
 	}
@@ -78,6 +79,7 @@ func NewTaskManager(ctx context.Context, config *RetryConfig, winSize int, sendF
 		ctx:        tmCtx,
 		cancel:     cancel,
 		config:     config,
+		device:     device,
 		windowSize: winSize,
 		pending:    make(map[uint32]*OutgoingMessage),
 		queue:      make([]*OutgoingMessage, 0),
@@ -223,6 +225,7 @@ func (tm *TaskManager) checkTimeouts() {
 				msg.Deadline = now.Add(msg.NextTimeout)
 
 				logger.Debug("IKE 请求触发滑动窗口重传",
+					logger.String("device", tm.device),
 					logger.Uint32("msgID", id),
 					logger.Int("retry", msg.RetryCount),
 					logger.Duration("nextDeadline", msg.NextTimeout))

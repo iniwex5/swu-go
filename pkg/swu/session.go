@@ -318,7 +318,7 @@ func (s *Session) connectOnce() error {
 	s.Logger.Debug("初始化滑动窗口队列任务调度器 TaskManager", logger.Int("windowSize", 5))
 
 	// 在 Socket 启动前暂不配置 sendFunc，等到下面 socket.Start() 之后重载
-	s.taskMgr = NewTaskManager(s.ctx, nil, 5, nil)
+	s.taskMgr = NewTaskManager(s.ctx, s.cfg.DeviceID, nil, 5, nil)
 
 	// 1. 设置网络 (Socket)
 	localPort := s.cfg.LocalPort
@@ -332,10 +332,10 @@ func (s *Session) connectOnce() error {
 	if s.cfg.TransportFactory != nil {
 		s.socket, err = s.cfg.TransportFactory(localBind, remoteAddr)
 	} else {
-		s.socket, err = ipsec.NewSocketManager(localBind, remoteAddr, s.cfg.DNSServer)
+		s.socket, err = ipsec.NewSocketManager(s.cfg.DeviceID, localBind, remoteAddr, s.cfg.DNSServer)
 		if err != nil && localPort != 0 {
 			localBind = fmt.Sprintf("%s:%d", s.cfg.LocalAddr, 0)
-			s.socket, err = ipsec.NewSocketManager(localBind, remoteAddr, s.cfg.DNSServer)
+			s.socket, err = ipsec.NewSocketManager(s.cfg.DeviceID, localBind, remoteAddr, s.cfg.DNSServer)
 		}
 	}
 	if err != nil {
@@ -2090,6 +2090,7 @@ func (s *Session) sendEncryptedWithRetry(payloads []ikev2.Payload, exchangeType 
 	s.lastEncryptedMsg = packets[0]
 	s.lastEncryptedMsgID = msgID
 	logger.Debug("发送加密 IKE 消息（已送入并发重传窗口）",
+		logger.String("device", s.cfg.DeviceID),
 		logger.Uint64("spii", s.SPIi),
 		logger.Uint64("spir", s.SPIr),
 		logger.Uint32("msgid", msgID),

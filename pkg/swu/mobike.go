@@ -53,7 +53,7 @@ func (s *Session) UpdateAddresses(newLocalAddr, newRemoteAddr string) error {
 	if s.cfg.TransportFactory != nil {
 		newSocket, err = s.cfg.TransportFactory(localBind, remoteBind)
 	} else {
-		newSocket, err = ipsec.NewSocketManager(localBind, remoteBind, s.cfg.DNSServer)
+		newSocket, err = ipsec.NewSocketManager(s.cfg.DeviceID, localBind, remoteBind, s.cfg.DNSServer)
 	}
 	if err != nil {
 		return fmt.Errorf("绑定新 Socket 失败: %v", err)

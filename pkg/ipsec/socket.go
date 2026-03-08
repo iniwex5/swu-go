@@ -16,6 +16,7 @@ import (
 )
 
 type SocketManager struct {
+	DeviceID   string
 	Conn       *net.UDPConn
 	LocalAddr  *net.UDPAddr
 	RemoteAddr *net.UDPAddr
@@ -48,7 +49,7 @@ func (s *SocketManager) NetEventsChan() <-chan NetEvent {
 	return s.NetEvents
 }
 
-func NewSocketManager(local, remote string, dnsServer string) (*SocketManager, error) {
+func NewSocketManager(deviceID, local, remote string, dnsServer string) (*SocketManager, error) {
 	rAddr, remoteIPs, err := resolveUDPAddrAll(remote, dnsServer)
 	if err != nil {
 		return nil, err
@@ -77,6 +78,7 @@ func NewSocketManager(local, remote string, dnsServer string) (*SocketManager, e
 	}
 
 	return &SocketManager{
+		DeviceID:   deviceID,
 		Conn:       conn,
 		LocalAddr:  lAddr,
 		RemoteAddr: rAddr,
@@ -478,6 +480,7 @@ func (s *SocketManager) SetUDPEncap() error {
 	}
 
 	logger.Info("已在 socket 上设置 UDP_ENCAP_ESPINUDP",
+		logger.String("device", s.DeviceID),
 		logger.String("local", s.LocalAddr.String()))
 	return nil
 }

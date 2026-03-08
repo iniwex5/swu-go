@@ -5,6 +5,7 @@ import (
 )
 
 type Config struct {
+	DeviceID  string
 	EpDGAddr  string
 	EpDGPort  uint16 // 默认 500
 	APN       string
