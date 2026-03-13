@@ -49,9 +49,12 @@ func (ctx *FastReauthContext) CanUseReauth() bool {
 
 // BuildReauthResponse 构建重认证响应
 // AT_COUNTER + AT_COUNTER_TOO_SMALL (如果需要) + AT_MAC
-func (ctx *FastReauthContext) BuildReauthResponse(nonceS []byte, counter uint16) ([]byte, error) {
+func (ctx *FastReauthContext) BuildReauthResponse(nonceS []byte, counter uint16, counterTooSmall bool) ([]byte, error) {
 	ctx.NonceS = nonceS
-	ctx.Counter = counter
+	ctx.CounterSmall = counterTooSmall
+	if !counterTooSmall {
+		ctx.Counter = counter
+	}
 
 	// 验证计数器
 	// 如果服务器计数器太小，设置 CounterSmall 标志
@@ -62,6 +65,11 @@ func (ctx *FastReauthContext) BuildReauthResponse(nonceS []byte, counter uint16)
 	// AT_COUNTER (固定 4 字节)
 	response = append(response, AT_COUNTER, 1) // Type=19, Length=1 (4 bytes)
 	response = append(response, byte(counter>>8), byte(counter))
+
+	if counterTooSmall {
+		// AT_COUNTER_TOO_SMALL (固定 4 字节, 无 Value)
+		response = append(response, AT_COUNTER_TOO_SMALL, 1, 0, 0)
+	}
 
 	// AT_MAC 需要在最后计算
 	// 预留 20 字节 (Type + Length + Reserved + 16字节 MAC)
@@ -76,6 +84,3 @@ func (ctx *FastReauthContext) BuildReauthResponse(nonceS []byte, counter uint16)
 
 	return response, nil
 }
-
-// 注意: AT_COUNTER, AT_COUNTER_TOO_SMALL, AT_NONCE_S, AT_NEXT_REAUTH_ID
-// 已在 packet.go 中定义

@@ -7,6 +7,20 @@ import (
 	"github.com/iniwex5/swu-go/pkg/ikev2"
 )
 
+func configuredIKEProposalSummary(cfg []string) []string {
+	if len(cfg) == 0 {
+		return []string{"default-multi-proposal"}
+	}
+	return append([]string(nil), cfg...)
+}
+
+func configuredESPProposalSummary(cfg []string) []string {
+	if len(cfg) == 0 {
+		return []string{"default-multi-proposal"}
+	}
+	return append([]string(nil), cfg...)
+}
+
 type encrSpec struct {
 	alg    ikev2.AlgorithmType
 	keyLen int
@@ -58,6 +72,17 @@ func parseIKEProposal(raw string, num uint8, spi []byte) (*ikev2.Proposal, error
 	s := normalizeProposal(raw)
 	if s == "" {
 		return nil, fmt.Errorf("empty IKE proposal")
+	}
+	if s == "sunriselegacyandroid" {
+		prop := ikev2.NewProposal(num, ikev2.ProtoIKE, spi)
+		prop.AddTransformWithKeyLen(ikev2.TransformTypeEncr, ikev2.ENCR_AES_CBC, 128)
+		prop.AddTransformWithKeyLen(ikev2.TransformTypeEncr, ikev2.ENCR_AES_CBC, 256)
+		prop.AddTransform(ikev2.TransformTypeEncr, ikev2.ENCR_3DES, 0)
+		prop.AddTransform(ikev2.TransformTypeEncr, ikev2.ENCR_DES, 0)
+		prop.AddTransform(ikev2.TransformTypeInteg, ikev2.AUTH_HMAC_SHA1_96, 0)
+		prop.AddTransform(ikev2.TransformTypePRF, ikev2.PRF_HMAC_SHA1, 0)
+		prop.AddTransform(ikev2.TransformTypeDH, ikev2.MODP_1024_bit, 0)
+		return prop, nil
 	}
 
 	parts := strings.Split(s, "-")
@@ -173,6 +198,10 @@ func parseEncr(v string) (encrSpec, error) {
 		return encrSpec{alg: ikev2.ENCR_AES_CBC, keyLen: 128, aead: false}, nil
 	case "aes256":
 		return encrSpec{alg: ikev2.ENCR_AES_CBC, keyLen: 256, aead: false}, nil
+	case "3des":
+		return encrSpec{alg: ikev2.ENCR_3DES, keyLen: 0, aead: false}, nil
+	case "des":
+		return encrSpec{alg: ikev2.ENCR_DES, keyLen: 0, aead: false}, nil
 	case "aes128gcm16":
 		return encrSpec{alg: ikev2.ENCR_AES_GCM_16, keyLen: 128, aead: true}, nil
 	case "aes256gcm16":

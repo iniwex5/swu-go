@@ -174,7 +174,7 @@ func (s *Session) buildIKESAInitPacket() ([]byte, error) {
 		NotifyType: ikev2.IKEV2_FRAGMENTATION_SUPPORTED,
 	}
 
-	// 顺序: [COOKIE], SA, KE, Nonce, FRAG, NAT_SRC, NAT_DST
+	// 顺序: [COOKIE], SA, KE, Nonce, NAT_SRC, NAT_DST, FRAG
 	var payloads []ikev2.Payload
 
 	// RFC 7296 §2.6: Cookie类型的通知有效负载必须是第一个有效负载
@@ -186,8 +186,8 @@ func (s *Session) buildIKESAInitPacket() ([]byte, error) {
 		})
 	}
 
-	payloads = append(payloads, saPayload, kePayload, noncePayload, fragNotify)
-	payloads = append(payloads, natSrcPayload, natDstPayload)
+	payloads = append(payloads, saPayload, kePayload, noncePayload)
+	payloads = append(payloads, natSrcPayload, natDstPayload, fragNotify)
 
 	packet := ikev2.NewIKEPacket()
 	packet.Header.SPIi = s.SPIi
@@ -369,19 +369,19 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 		expNatSrc := ikev2.CalculateNATDetectionHash(s.SPIi, s.SPIr, localIP, localPort)
 		expNatDst := ikev2.CalculateNATDetectionHash(s.SPIi, s.SPIr, remoteIP, remotePort)
 
-			natDetected := !bytes.Equal(natSrc, expNatSrc) || !bytes.Equal(natDst, expNatDst)
-			if natDetected {
-				if setter, ok := s.socket.(interface{ SetRemotePort(int) }); ok {
-					setter.SetRemotePort(4500)
-				}
-				natKeepalive := s.cfg.NATKeepaliveSeconds
-				if natKeepalive <= 0 {
-					natKeepalive = 20
-				}
-				s.startNATKeepalive(time.Duration(natKeepalive) * time.Second)
-				s.Logger.Debug("检测到 NAT，切换到 UDP 4500")
+		natDetected := !bytes.Equal(natSrc, expNatSrc) || !bytes.Equal(natDst, expNatDst)
+		if natDetected {
+			if setter, ok := s.socket.(interface{ SetRemotePort(int) }); ok {
+				setter.SetRemotePort(4500)
 			}
+			natKeepalive := s.cfg.NATKeepaliveSeconds
+			if natKeepalive <= 0 {
+				natKeepalive = 20
+			}
+			s.startNATKeepalive(time.Duration(natKeepalive) * time.Second)
+			s.Logger.Debug("检测到 NAT，切换到 UDP 4500")
 		}
+	}
 
 	// 处理 SA 选择 (简化: 假设服务器接受了我们的提议)
 	// 我们应该解析 `saPayload.Proposals[0]` 以查看选择了什么。
@@ -425,6 +425,21 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 		logger.String("prf", ikev2.PRFToString(prfID)),
 		logger.String("dh", ikev2.DHToString(dhID)),
 	)
+	if len(s.cfg.IKEProposals) > 0 {
+		s.Logger.Info("IKE SA 发起画像对照",
+			logger.Any("configured_ike_proposals", configuredIKEProposalSummary(s.cfg.IKEProposals)),
+			logger.String("selected_profile", classifyIKEProfile(encrID, integID, prfID)),
+			logger.String("selected_encr", ikev2.EncrToString(encrID)),
+			logger.String("selected_integ", ikev2.IntegToString(integID)),
+			logger.String("selected_prf", ikev2.PRFToString(prfID)),
+			logger.String("selected_dh", ikev2.DHToString(dhID)))
+		if classifyIKEProfile(encrID, integID, prfID) == "sha1_legacy" {
+			s.Logger.Warn("服务端未采用本地首选 IKE 画像，回落到 legacy 算法组合",
+				logger.Any("configured_ike_proposals", configuredIKEProposalSummary(s.cfg.IKEProposals)),
+				logger.String("selected_profile", classifyIKEProfile(encrID, integID, prfID)),
+				logger.String("selected_dh", ikev2.DHToString(dhID)))
+		}
+	}
 
 	// 设置加密实例
 	s.PRFAlg, err = crypto.GetPRF(prfID)

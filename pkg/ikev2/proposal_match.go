@@ -185,17 +185,30 @@ func CreateMultiProposalIKE(spi []byte) []*Proposal {
 		prop.AddTransform(TransformTypeDH, MODP_1024_bit, 0)
 		prop.AddTransform(TransformTypeDH, MODP_1536_bit, 0)
 		prop.AddTransform(TransformTypeDH, MODP_2048_bit, 0)
-		// 保持原有首发兼容顺序不变，只追加 MODP3072 以提升对更现代 ePDG 的兼容性。
 		prop.AddTransform(TransformTypeDH, MODP_3072_bit, 0)
-		// 再追加 ECP 组，作为更现代网络的兼容项，但不改变现有 MODP 首发顺序。
 		prop.AddTransform(TransformTypeDH, ECP_256_bit, 0)
 		prop.AddTransform(TransformTypeDH, ECP_384_bit, 0)
 		return prop
 	}
+
+	makePropStrict := func(num uint8, encr AlgorithmType, keyLen int, integ, prf, dh AlgorithmType) *Proposal {
+		prop := NewProposal(num, ProtoIKE, spi)
+		prop.AddTransformWithKeyLen(TransformTypeEncr, encr, keyLen)
+		prop.AddTransform(TransformTypeInteg, integ, 0)
+		prop.AddTransform(TransformTypePRF, prf, 0)
+		prop.AddTransform(TransformTypeDH, dh, 0)
+		return prop
+	}
+
 	return []*Proposal{
-		makeProp(1, AUTH_HMAC_SHA2_256_128, PRF_HMAC_SHA2_256),
-		makeProp(2, AUTH_HMAC_SHA1_96, PRF_HMAC_SHA1),
-		makeProp(3, AUTH_AES_XCBC_96, PRF_AES128_XCBC),
+		// 提议 1: 严格对齐大多数由于网关限制只接受单一纯净组合的场景 (如 Sunrise 22802 强依赖)
+		makePropStrict(1, ENCR_AES_CBC, 128, AUTH_HMAC_SHA2_256_128, PRF_HMAC_SHA2_256, MODP_2048_bit),
+		// 提议 2: 原版高兼容 SHA2 组 (内联多个长度/DH组供服务端自行挑选)
+		makeProp(2, AUTH_HMAC_SHA2_256_128, PRF_HMAC_SHA2_256),
+		// 提议 3: 老旧但常见的 HMAC-SHA1
+		makeProp(3, AUTH_HMAC_SHA1_96, PRF_HMAC_SHA1),
+		// 提议 4: AES-XCBC 兜底族
+		makeProp(4, AUTH_AES_XCBC_96, PRF_AES128_XCBC),
 	}
 }
 
@@ -250,3 +263,5 @@ func (p *Proposal) AddTransformWithKeyLen(tType TransformType, tID AlgorithmType
 	}
 	p.Transforms = append(p.Transforms, t)
 }
+
+

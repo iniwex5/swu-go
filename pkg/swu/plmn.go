@@ -73,6 +73,20 @@ func buildAKAIdentity(imsi string, cfg *Config) string {
 }
 
 func buildIKEIdentity(imsi string, cfg *Config) string {
+	// 当配置了 AKAPrimePreferred 时，IKE IDi 使用 "6" 前缀 NAI，
+	// 主动向 AAA 声明客户端期望 EAP-AKA'（而非默认的 EAP-AKA）。
+	if cfg.AKAPrimePreferred {
+		switch cfg.IKEIdentityMode {
+		case "imsi_only":
+			return "6" + imsi
+		case "wlan_nai":
+			return buildAKAPrimeWLANNAI(imsi, cfg)
+		case "epc_nai", "":
+			return buildAKAPrimeNAI(imsi, cfg)
+		default:
+			return buildAKAPrimeNAI(imsi, cfg)
+		}
+	}
 	switch cfg.IKEIdentityMode {
 	case "imsi_only":
 		return "0" + imsi
@@ -86,7 +100,9 @@ func buildIKEIdentity(imsi string, cfg *Config) string {
 }
 
 func buildAKAIdentityForEAPType(imsi string, cfg *Config, eapType uint8) string {
-	if eapType == 50 && cfg != nil && cfg.AKAPrimePreferred {
+	// 当服务端使用 EAP-AKA' (type=50) 时，自动使用 "6" 前缀 NAI (3GPP TS 23.003 §19.3)
+	// 不再依赖 AKAPrimePreferred 配置——始终跟随服务端协商的 EAP Type 自动适配
+	if eapType == 50 {
 		switch cfg.AKAIdentityMode {
 		case "imsi_only":
 			return "6" + imsi

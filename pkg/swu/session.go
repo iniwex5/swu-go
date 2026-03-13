@@ -125,9 +125,12 @@ type Session struct {
 	lastEncryptedMsgID uint32
 
 	// RFC 4187 AT_CHECKCODE: 累积 EAP-AKA Identity 往返报文，供 Challenge 阶段计算校验码。
-	akaIdentityTranscript [][]byte
-	ikeIdentity           string
-	eapIdentity           string
+	akaIdentityTranscript  [][]byte
+	ikeIdentity            string
+	eapIdentity            string
+	negotiatedEAPType      uint8 // 当前会话协商的 EAP 类型 (23=AKA, 50=AKA')，0 表示尚未确定
+	serverSupportsAKAPrime bool
+	biddingDownObserved    bool
 
 	// COOKIE 处理
 	cookie     []byte // ePDG 返回的 COOKIE
@@ -274,6 +277,7 @@ func initFastReauthCtx(cfg *Config) *eap.FastReauthContext {
 // Connect 连接到 ePDG，支持 REDIRECT 重连和 Reauthentication
 func (s *Session) Connect(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
+	defer close(s.done) // 无论成功/失败/快速退出，均通知上层 WaitDone 结束
 	const maxRedirects = 3
 	redirectCount := 0
 
@@ -667,7 +671,6 @@ func (s *Session) connectOnce() error {
 	}
 
 	s.cleanupNetworkConfig()
-	close(s.done) // 通知外部清理已完成
 
 	if err == ErrReauth {
 		return err
@@ -774,6 +777,11 @@ func (s *Session) startNetEventMonitor() {
 		return
 	}
 	go func() {
+		const preKeyUnreachThreshold = 3
+		const preKeyUnreachWindow = 5 * time.Second
+		preKeyUnreachCount := 0
+		var preKeyFirstSeen time.Time
+
 		for {
 			select {
 			case <-s.ctx.Done():
@@ -800,9 +808,32 @@ func (s *Session) startNetEventMonitor() {
 						logger.String("reason", ev.Reason))
 					// 直接发起一次 DPD 加速验证，如果在发 DPD 期间发生漂移将直接救活。
 					if s.Keys == nil || s.EncAlg == nil {
-						s.Logger.Warn("收到 ICMP 但当前会话密钥未生成完，舍弃智能 DPD 以免 Panic")
+						now := time.Now()
+						if preKeyFirstSeen.IsZero() || now.Sub(preKeyFirstSeen) > preKeyUnreachWindow {
+							preKeyFirstSeen = now
+							preKeyUnreachCount = 1
+						} else {
+							preKeyUnreachCount++
+						}
+						s.Logger.Warn("收到 ICMP 但当前会话密钥未生成完，舍弃智能 DPD 以免 Panic",
+							logger.Int("pre_key_unreach_count", preKeyUnreachCount),
+							logger.Duration("window", preKeyUnreachWindow))
+						if preKeyUnreachCount >= preKeyUnreachThreshold {
+							err := fmt.Errorf("IKE_SA_INIT 阶段连续收到 ICMP host unreachable(%d/%ds): %s",
+								preKeyUnreachCount,
+								int(preKeyUnreachWindow.Seconds()),
+								ev.Reason)
+							s.setTerminalError(err)
+							s.Logger.Error("启动期网络不可达，快速失败并触发上层切换 ePDG/IP 重试", logger.Err(err))
+							if s.cancel != nil {
+								s.cancel()
+							}
+							return
+						}
 						break
 					}
+					preKeyUnreachCount = 0
+					preKeyFirstSeen = time.Time{}
 					go func() {
 						if err := s.sendDPD(); err != nil {
 							s.Logger.Warn("智能 DPD 探测失败", logger.Err(err))
