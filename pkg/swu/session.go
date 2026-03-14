@@ -128,6 +128,7 @@ type Session struct {
 	akaIdentityTranscript  [][]byte
 	ikeIdentity            string
 	eapIdentity            string
+	eapSuccessReceived     bool
 	negotiatedEAPType      uint8 // 当前会话协商的 EAP 类型 (23=AKA, 50=AKA')，0 表示尚未确定
 	serverSupportsAKAPrime bool
 	biddingDownObserved    bool
@@ -318,6 +319,8 @@ func (s *Session) Connect(ctx context.Context) error {
 func (s *Session) connectOnce() error {
 	handshakeStart := time.Now()
 	var err error
+	s.eapSuccessReceived = false
+	s.akaIdentityTranscript = nil
 
 	s.Logger.Debug("初始化滑动窗口队列任务调度器 TaskManager", logger.Int("windowSize", 5))
 
@@ -579,6 +582,9 @@ func (s *Session) connectOnce() error {
 			break
 		}
 
+		if !s.eapSuccessReceived {
+			return errors.New("EAP 认证未收到 Success，拒绝发送 final AUTH")
+		}
 		if err := s.handleIKEAuthFinalResp(respData); err != nil {
 			s.Logger.Debug("EAP 成功响应未完成 CHILD_SA，尝试发送最终 AUTH")
 			finalPayloads, err := s.buildIKEAuthFinalPayloads()

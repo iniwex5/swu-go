@@ -62,8 +62,9 @@ func (s *Session) appendAKAIdentityTranscript(pkt []byte) {
 	s.akaIdentityTranscript = append(s.akaIdentityTranscript, cloneBytes(pkt))
 }
 
-// calcAKACheckcode 计算包含了待发送 response (其中 mac/checkcode 提前被置0) 的 EAP-AKA Hash
-func (s *Session) calcAKACheckcode(hashType string, eapType, identifier, subtype uint8, attrs []byte) []byte {
+// calcAKACheckcode 计算 EAP-AKA/AKA' 的 AT_CHECKCODE。
+// RFC 4187 §10.13: 仅覆盖 AKA-Identity 往返报文（按传输顺序），不包含 Challenge/Response 本身。
+func (s *Session) calcAKACheckcode(hashType string) []byte {
 	var sum hash.Hash
 	var hashLen int
 	if hashType == "sha256" {
@@ -74,25 +75,11 @@ func (s *Session) calcAKACheckcode(hashType string, eapType, identifier, subtype
 		hashLen = 20
 	}
 
-	// 1. 将之前历史的所有 EAP 包哈希 (包含当前的 Challenge Request，调用方应提前 append)
+	// 仅哈希 Identity 往返 transcript。
 	for _, pkt := range s.akaIdentityTranscript {
 		sum.Write(pkt)
 	}
 
-	// 2. 将当前的 Response 包哈希
-	// 注意 RFC 要求在计算 checkcode 时，MAC 和 Checkcode 字段全看作 0
-	// 这里传进来的 attrs 应该已经由调用方把 MAC 和 Checkcode 位置留空填了 0
-	respPkt := &eap.EAPPacket{
-		Code:       eap.CodeResponse,
-		Identifier: identifier,
-		Type:       eapType,
-		Subtype:    subtype,
-		Data:       attrs,
-	}
-	encodedResp := respPkt.Encode()
-	sum.Write(encodedResp)
-
-	// 计算出完整的 hash 摘要
 	checkcode := sum.Sum(nil)
 	if len(checkcode) != hashLen {
 		return make([]byte, hashLen) // 防错
@@ -340,6 +327,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 	if pkt.Code == eap.CodeSuccess {
 		// EAP 成功！
 		s.Logger.Info("收到 EAP Success")
+		s.eapSuccessReceived = true
 		// 在 IKE_AUTH 中，EAP Success 通常伴随着服务器的 AUTH 载荷。
 		// 这在 session.go 的循环中处理。
 		// 我们这里只返回 nil 以表示不需要 EAP 响应。
@@ -525,9 +513,12 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 			return nil, err
 		}
 		respData := []byte{}
+		var notifCode uint16
+		var hasNotifCode bool
 		if atNotif, ok := attrs[eap.AT_NOTIFICATION]; ok {
 			if len(atNotif.Value) >= 2 {
-				notifCode := uint16(atNotif.Value[0])<<8 | uint16(atNotif.Value[1])
+				notifCode = uint16(atNotif.Value[0])<<8 | uint16(atNotif.Value[1])
+				hasNotifCode = true
 				s.Logger.Info("收到 EAP-AKA Notification 请求",
 					logger.Int("notification_code", int(notifCode)),
 					logger.String("meaning", eap.NotificationCodeToString(notifCode)))
@@ -548,6 +539,11 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 			logger.Int("eap_type", int(pkt.Type)),
 			logger.String("hex", fmt.Sprintf("%x", encodedResp)))
 
+		if hasNotifCode && eap.IsFailureNotificationCode(notifCode) {
+			return nil, fmt.Errorf("EAP 认证被拒绝 (AT_NOTIFICATION=%d: %s)",
+				notifCode, eap.NotificationCodeToString(notifCode))
+		}
+
 		eapPayload := &ikev2.EncryptedPayloadEAP{EAPMessage: encodedResp}
 		return []ikev2.Payload{eapPayload}, nil
 	}
@@ -559,9 +555,6 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		s.biddingDownObserved = false
 		s.Logger.Info("收到 EAP-AKA Challenge (4G 模式)",
 			logger.String("eap_challenge_raw_hex", fmt.Sprintf("%x", eapRaw)))
-
-		// RFC 4187 §10.13: EAP-AKA Challenge 报文必须纳入 transcript 供 AT_CHECKCODE 计算
-		s.appendAKAIdentityTranscript(eapRaw)
 
 		attrs, err := eap.ParseAttributes(pkt.Data)
 		if err != nil {
@@ -754,13 +747,16 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 				atResultIndAttr := &eap.Attribute{Type: eap.AT_RESULT_IND, Value: make([]byte, 2)}
 				respAttrs = append(respAttrs, atResultIndAttr.Encode()...)
 			}
-			if hasCheckcode && len(s.akaIdentityTranscript) > 0 {
-				// RFC 4187 Section 10.13: Checkcode
-				// Attribute 的 Value 开头必须自带 2 字节 Reserved。
-				// Checkcode 长度 = 20(SHA1) / 32(SHA256)。
-				checkcodeLen = 20
-				checkcodeOffset = len(respAttrs) + 4 // 指向 Header(2) + Reserved(2) 后面的实际 Hash 起点
-				atCheckcodeVal := make([]byte, 2+checkcodeLen)
+			if hasCheckcode {
+				// RFC 4187 §10.13:
+				// - 有 Identity 往返时: Value=Reserved(2)+SHA1(20)
+				// - 无 Identity 往返时: Value 仅 Reserved(2)，表示无可校验的 Identity transcript
+				checkcodeOffset = len(respAttrs) + 4 // Header(2) + Reserved(2) 之后
+				atCheckcodeVal := make([]byte, 2)
+				if len(s.akaIdentityTranscript) > 0 {
+					checkcodeLen = 20
+					atCheckcodeVal = make([]byte, 2+checkcodeLen)
+				}
 				atCheckcodeAttr := &eap.Attribute{Type: eap.AT_CHECKCODE, Value: atCheckcodeVal}
 				respAttrs = append(respAttrs, atCheckcodeAttr.Encode()...)
 			}
@@ -774,7 +770,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		// 如果分配了 Checkcode 槽位，先计算 Checkcode 并填入 respAttrs。
 		var checkcodeDigest string
 		if checkcodeLen > 0 {
-			checkcodeVal := s.calcAKACheckcode("sha1", eap.TypeAKA, pkt.Identifier, eap.SubtypeChallenge, respAttrs)
+			checkcodeVal := s.calcAKACheckcode("sha1")
 			// 回填到 respAttrs 中
 			copy(respAttrs[checkcodeOffset:checkcodeOffset+checkcodeLen], checkcodeVal)
 			checkcodeDigest = eapAttrDigest(checkcodeVal)
@@ -1098,12 +1094,15 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 				atResultIndAttr := &eap.Attribute{Type: eap.AT_RESULT_IND, Value: make([]byte, 2)}
 				respAttrs = append(respAttrs, atResultIndAttr.Encode()...)
 			}
-			if hasCheckcode && len(s.akaIdentityTranscript) > 0 {
-				// RFC 5448: EAP-AKA' AT_CHECKCODE 采用 SHA-256 计算出 32 字节 Hash。
-				// Value 也是 2 字节 Reserved + 32 字节。
-				checkcodeLen = 32
+			if hasCheckcode {
+				// RFC 5448: AKA' 中 AT_CHECKCODE 使用 SHA-256；
+				// 无 Identity 往返时仅保留 Reserved(2)。
 				checkcodeOffset = len(respAttrs) + 4
-				atCheckcodeVal := make([]byte, 2+checkcodeLen)
+				atCheckcodeVal := make([]byte, 2)
+				if len(s.akaIdentityTranscript) > 0 {
+					checkcodeLen = 32
+					atCheckcodeVal = make([]byte, 2+checkcodeLen)
+				}
 				atCheckcodeAttr := &eap.Attribute{Type: eap.AT_CHECKCODE, Value: atCheckcodeVal}
 				respAttrs = append(respAttrs, atCheckcodeAttr.Encode()...)
 			}
@@ -1124,7 +1123,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		// 此时 MAC 位置的数据是全零，满足 Checkcode 计算要求。
 		var checkcodeDigest string
 		if checkcodeLen > 0 {
-			checkcodeVal := s.calcAKACheckcode("sha256", eap.TypeAKAPrime, pkt.Identifier, eap.SubtypeChallenge, respAttrs)
+			checkcodeVal := s.calcAKACheckcode("sha256")
 			copy(respAttrs[checkcodeOffset:checkcodeOffset+checkcodeLen], checkcodeVal)
 			checkcodeDigest = eapAttrDigest(checkcodeVal)
 		}
