@@ -55,15 +55,20 @@ func uint16Value(dh *crypto.DiffieHellman) uint16 {
 	return dh.Group
 }
 
-func (s *Session) appendAKAIdentityTranscript(pkt []byte) {
+func (s *Session) appendEAPTranscript(pkt []byte) {
 	if len(pkt) == 0 {
 		return
 	}
-	s.akaIdentityTranscript = append(s.akaIdentityTranscript, cloneBytes(pkt))
+	s.eapTranscript = append(s.eapTranscript, cloneBytes(pkt))
+}
+
+func shouldEchoATCheckcode(value []byte) bool {
+	// RFC 4187/5448: Value 至少包含 2 字节 Reserved；仅当服务端携带了摘要空间时才回传。
+	return len(value) > 2
 }
 
 // calcAKACheckcode 计算 EAP-AKA/AKA' 的 AT_CHECKCODE。
-// RFC 4187 §10.13: 仅覆盖 AKA-Identity 往返报文（按传输顺序），不包含 Challenge/Response 本身。
+// RFC 4187 §10.13: 覆盖直到本包为止的所有 EAP-Request/Response 报文（按传输顺序）。
 func (s *Session) calcAKACheckcode(hashType string) []byte {
 	var sum hash.Hash
 	var hashLen int
@@ -75,8 +80,8 @@ func (s *Session) calcAKACheckcode(hashType string) []byte {
 		hashLen = 20
 	}
 
-	// 仅哈希 Identity 往返 transcript。
-	for _, pkt := range s.akaIdentityTranscript {
+	// 哈希转录中的所有 EAP 报文。
+	for _, pkt := range s.eapTranscript {
 		sum.Write(pkt)
 	}
 
@@ -175,7 +180,7 @@ func (s *Session) buildIKEAuthInitPayloads() ([]ikev2.Payload, error) {
 	}
 
 	// 使用配置驱动的 ESP Proposal；为空时回退到内置大兼容集合。
-	proposals, err := buildESPProposals(s.cfg.ESPProposals, spiBytes)
+	proposals, err := buildESPProposals(s.cfg, spiBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -490,8 +495,8 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		}
 
 		encodedResp := respPkt.Encode()
-		s.appendAKAIdentityTranscript(eapRaw)
-		s.appendAKAIdentityTranscript(encodedResp)
+		s.appendEAPTranscript(eapRaw)
+		s.appendEAPTranscript(encodedResp)
 		s.Logger.Debug("已构造 EAP Identity Response",
 			logger.String("identity", nai),
 			logger.Bool("with_identity_attr", sendIdentityAttr),
@@ -550,6 +555,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 
 	// 处理 AKA 挑战
 	if pkt.Type == eap.TypeAKA && pkt.Subtype == eap.SubtypeChallenge {
+		s.appendEAPTranscript(eapRaw) // 按照 RFC 4187，AT_CHECKCODE 应包含当前的 Challenge Request
 		s.negotiatedEAPType = eap.TypeAKA
 		s.serverSupportsAKAPrime = false
 		s.biddingDownObserved = false
@@ -583,6 +589,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 			s.Logger.Debug("EAP-AKA Challenge 字段摘要", logger.String("at_bidding", eapAttrDigest(atBidding.Value)))
 		}
 		atCheckcode, hasCheckcode := attrs[eap.AT_CHECKCODE]
+		shouldEchoCheckcode := hasCheckcode && shouldEchoATCheckcode(atCheckcode.Value)
 		if hasCheckcode {
 			s.Logger.Info("服务器下发 AT_CHECKCODE")
 			s.Logger.Debug("EAP-AKA Challenge 字段摘要", logger.String("at_checkcode", eapAttrDigest(atCheckcode.Value)))
@@ -735,45 +742,32 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		atRes := &eap.Attribute{Type: eap.AT_RES, Value: resValue}
 		respAttrs = append(respAttrs, atRes.Encode()...)
 
-		// 用于标记是否占位了 CHECKCODE 以及它的长度
-		var checkcodeLen int
-		var checkcodeOffset int
+		// 服务端 AT_CHECKCODE 原样回显缓存（严格回显）
+		var echoedCheckcodeValue []byte
 		chMode := strings.ToLower(s.cfg.AKAChallengeMode)
 
 		// 检查配置，决定是否附加 AT_RESULT_IND, AT_CHECKCODE 等属性
-		if chMode == "echo" || chMode == "checkcode" {
-			if hasResultInd {
-				// RFC 4187 §10.14: 值字段为空（长度为 1，即仅有 Header）
-				atResultIndAttr := &eap.Attribute{Type: eap.AT_RESULT_IND, Value: make([]byte, 2)}
-				respAttrs = append(respAttrs, atResultIndAttr.Encode()...)
-			}
-			if hasCheckcode {
-				// RFC 4187 §10.13:
-				// - 有 Identity 往返时: Value=Reserved(2)+SHA1(20)
-				// - 无 Identity 往返时: Value 仅 Reserved(2)，表示无可校验的 Identity transcript
-				checkcodeOffset = len(respAttrs) + 4 // Header(2) + Reserved(2) 之后
-				atCheckcodeVal := make([]byte, 2)
-				if len(s.akaIdentityTranscript) > 0 {
-					checkcodeLen = 20
-					atCheckcodeVal = make([]byte, 2+checkcodeLen)
+			if chMode == "echo" || chMode == "checkcode" {
+				if hasResultInd {
+					// RFC 4187 §10.14: 值字段为空（长度为 1，即仅有 Header）
+					atResultIndAttr := &eap.Attribute{Type: eap.AT_RESULT_IND, Value: make([]byte, 2)}
+					respAttrs = append(respAttrs, atResultIndAttr.Encode()...)
 				}
-				atCheckcodeAttr := &eap.Attribute{Type: eap.AT_CHECKCODE, Value: atCheckcodeVal}
-				respAttrs = append(respAttrs, atCheckcodeAttr.Encode()...)
+				if shouldEchoCheckcode {
+					// 严格回显服务端下发的 AT_CHECKCODE（含 Reserved 字段），不做本地重算。
+					echoedCheckcodeValue = append([]byte(nil), atCheckcode.Value...)
+					atCheckcodeAttr := &eap.Attribute{Type: eap.AT_CHECKCODE, Value: echoedCheckcodeValue}
+					respAttrs = append(respAttrs, atCheckcodeAttr.Encode()...)
+				}
 			}
-		}
 
 		// AT_MAC (占位 16 字节零)
 		respMacAttr := &eap.Attribute{Type: eap.AT_MAC, Value: make([]byte, 18)}
 		respAttrs = append(respAttrs, respMacAttr.Encode()...)
 
-		// 现在所有属性均构造完毕，MAC为0，Checkcode为0。
-		// 如果分配了 Checkcode 槽位，先计算 Checkcode 并填入 respAttrs。
 		var checkcodeDigest string
-		if checkcodeLen > 0 {
-			checkcodeVal := s.calcAKACheckcode("sha1")
-			// 回填到 respAttrs 中
-			copy(respAttrs[checkcodeOffset:checkcodeOffset+checkcodeLen], checkcodeVal)
-			checkcodeDigest = eapAttrDigest(checkcodeVal)
+		if len(echoedCheckcodeValue) > 0 {
+			checkcodeDigest = eapAttrDigest(echoedCheckcodeValue)
 		}
 		respAttrTypes := listEAPAttrTypes(respAttrs)
 		s.Logger.Info("EAP-AKA Challenge Response 属性摘要",
@@ -792,6 +786,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		if err != nil {
 			return nil, err
 		}
+		s.appendEAPTranscript(eapBytes) // 记录 Response 以备后续（如 Result Indication）
 		s.Logger.Info("EAP-AKA Challenge Response 已签名",
 			logger.String("identity", s.currentEAPIdentity()),
 			logger.String("matched_format", successfulFormat),
@@ -836,6 +831,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 
 	// EAP-AKA' Challenge (RFC 5448, 5G 核心网接入)
 	if pkt.Type == eap.TypeAKAPrime && pkt.Subtype == eap.SubtypeChallenge {
+		s.appendEAPTranscript(eapRaw)
 		s.negotiatedEAPType = eap.TypeAKAPrime
 		s.serverSupportsAKAPrime = true
 		s.biddingDownObserved = false
@@ -867,6 +863,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 			s.Logger.Debug("EAP-AKA' Challenge 字段摘要", logger.String("at_bidding", eapAttrDigest(atBidding.Value)))
 		}
 		atCheckcode, hasCheckcode := attrs[eap.AT_CHECKCODE]
+		shouldEchoCheckcode := hasCheckcode && shouldEchoATCheckcode(atCheckcode.Value)
 		if hasCheckcode {
 			s.Logger.Info("AKA' 服务器下发 AT_CHECKCODE（最小响应策略：仅记录，不回显）")
 			s.Logger.Debug("EAP-AKA' Challenge 字段摘要", logger.String("at_checkcode", eapAttrDigest(atCheckcode.Value)))
@@ -1082,31 +1079,24 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		atRes := &eap.Attribute{Type: eap.AT_RES, Value: resValue}
 		respAttrs = append(respAttrs, atRes.Encode()...)
 
-		// 收集 AT_CHECKCODE 长度偏移以便后面动态写入
-		var checkcodeLen int
-		var checkcodeOffset int
+		// 服务端 AT_CHECKCODE 原样回显缓存（严格回显）
+		var echoedCheckcodeValue []byte
 		chMode := strings.ToLower(s.cfg.AKAChallengeMode)
 
 		// 检查配置，决定是否附加 AT_RESULT_IND, AT_CHECKCODE 等属性
-		if chMode == "echo" || chMode == "checkcode" {
-			if hasResultInd {
-				// RFC 4187 §10.14: 值字段为空（长度为 1，即仅有 Header）
-				atResultIndAttr := &eap.Attribute{Type: eap.AT_RESULT_IND, Value: make([]byte, 2)}
-				respAttrs = append(respAttrs, atResultIndAttr.Encode()...)
-			}
-			if hasCheckcode {
-				// RFC 5448: AKA' 中 AT_CHECKCODE 使用 SHA-256；
-				// 无 Identity 往返时仅保留 Reserved(2)。
-				checkcodeOffset = len(respAttrs) + 4
-				atCheckcodeVal := make([]byte, 2)
-				if len(s.akaIdentityTranscript) > 0 {
-					checkcodeLen = 32
-					atCheckcodeVal = make([]byte, 2+checkcodeLen)
+			if chMode == "echo" || chMode == "checkcode" {
+				if hasResultInd {
+					// RFC 4187 §10.14: 值字段为空（长度为 1，即仅有 Header）
+					atResultIndAttr := &eap.Attribute{Type: eap.AT_RESULT_IND, Value: make([]byte, 2)}
+					respAttrs = append(respAttrs, atResultIndAttr.Encode()...)
 				}
-				atCheckcodeAttr := &eap.Attribute{Type: eap.AT_CHECKCODE, Value: atCheckcodeVal}
-				respAttrs = append(respAttrs, atCheckcodeAttr.Encode()...)
+				if shouldEchoCheckcode {
+					// 严格回显服务端下发的 AT_CHECKCODE（含 Reserved 字段），不做本地重算。
+					echoedCheckcodeValue = append([]byte(nil), atCheckcode.Value...)
+					atCheckcodeAttr := &eap.Attribute{Type: eap.AT_CHECKCODE, Value: echoedCheckcodeValue}
+					respAttrs = append(respAttrs, atCheckcodeAttr.Encode()...)
+				}
 			}
-		}
 
 		// AT_KDF (回显协商的 KDF ID)
 		kdfVal := make([]byte, 2)
@@ -1122,10 +1112,8 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		// 现在所有属性均组装完毕，计算包含本待发包信息的 Checkcode
 		// 此时 MAC 位置的数据是全零，满足 Checkcode 计算要求。
 		var checkcodeDigest string
-		if checkcodeLen > 0 {
-			checkcodeVal := s.calcAKACheckcode("sha256")
-			copy(respAttrs[checkcodeOffset:checkcodeOffset+checkcodeLen], checkcodeVal)
-			checkcodeDigest = eapAttrDigest(checkcodeVal)
+		if len(echoedCheckcodeValue) > 0 {
+			checkcodeDigest = eapAttrDigest(echoedCheckcodeValue)
 		}
 		respAttrTypes := listEAPAttrTypes(respAttrs)
 		s.Logger.Info("EAP-AKA' Challenge Response 属性摘要",
@@ -1145,6 +1133,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		if err != nil {
 			return nil, err
 		}
+		s.appendEAPTranscript(eapBytes)
 		s.Logger.Info("EAP-AKA' Challenge Response 已签名",
 			logger.String("identity", s.currentEAPIdentity()),
 			logger.String("matched_format", successfulFormat),

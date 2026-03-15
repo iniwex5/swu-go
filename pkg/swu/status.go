@@ -25,6 +25,10 @@ type SessionSnapshot struct {
 
 	PCSCFv4 []net.IP
 	PCSCFv6 []net.IP
+
+	OfferedIKEProfiles       []string
+	EffectiveCipherPolicy    string
+	NegotiationFallbackCount int
 }
 
 func (s *Session) Snapshot() SessionSnapshot {
@@ -84,6 +88,9 @@ func (s *Session) Snapshot() SessionSnapshot {
 	if out.IPv6Prefix == 0 && out.IPv6 != nil {
 		out.IPv6Prefix = 64
 	}
+	out.OfferedIKEProfiles = append([]string(nil), s.offeredIKEProfiles...)
+	out.EffectiveCipherPolicy = s.effectiveCipherPolicy
+	out.NegotiationFallbackCount = s.negotiationFallbackCount
 	return out
 }
 

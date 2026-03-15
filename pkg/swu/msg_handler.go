@@ -40,10 +40,15 @@ func (s *Session) decryptAndParse(data []byte) (uint32, []ikev2.Payload, error) 
 		if err != nil {
 			return msgID, nil, err
 		}
+		s.Logger.Debug("IKE 分片重组明文",
+			logger.Uint32("msgid", msgID),
+			logger.Int("len", len(reassembled)),
+			logger.String("plaintext_hex", fmt.Sprintf("%x", reassembled)))
 		// 解析第一个分片中记录的 NextPayload 类型
 		// SKF Generic Header 中的 NextPayload 指向重组后的第一个载荷
 		firstPayloadType := ikev2.PayloadType(data[ikev2.IKE_HEADER_LEN])
 		payloads, err := s.parsePayloads(reassembled, firstPayloadType)
+		s.logParsedIKEPayloads("IKE 分片重组 payload 明细", header.ExchangeType, msgID, payloads)
 		return msgID, payloads, err
 	}
 
@@ -52,6 +57,7 @@ func (s *Session) decryptAndParse(data []byte) (uint32, []ikev2.Payload, error) 
 		if err != nil || packet == nil {
 			return header.MessageID, nil, err
 		}
+		s.logParsedIKEPayloads("IKE 明文 payload 明细", header.ExchangeType, header.MessageID, packet.Payloads)
 		return header.MessageID, packet.Payloads, nil
 	}
 
@@ -107,9 +113,94 @@ func (s *Session) decryptAndParse(data []byte) (uint32, []ikev2.Payload, error) 
 		}
 		plaintext = plaintext[:len(plaintext)-1-padLen]
 	}
+	s.Logger.Debug("IKE SK 解密明文",
+		logger.Uint32("msgid", header.MessageID),
+		logger.Int("exchange", int(header.ExchangeType)),
+		logger.Int("len", len(plaintext)),
+		logger.String("plaintext_hex", fmt.Sprintf("%x", plaintext)))
 
 	payloads, err := s.parsePayloads(plaintext, genHeader.NextPayload)
+	s.logParsedIKEPayloads("IKE SK payload 明细", header.ExchangeType, header.MessageID, payloads)
 	return header.MessageID, payloads, err
+}
+
+func (s *Session) logParsedIKEPayloads(title string, exchangeType ikev2.ExchangeType, msgID uint32, payloads []ikev2.Payload) {
+	if len(payloads) == 0 {
+		s.Logger.Debug(title,
+			logger.Uint32("msgid", msgID),
+			logger.Int("exchange", int(exchangeType)),
+			logger.Int("payload_count", 0))
+		return
+	}
+
+	details := make([]map[string]interface{}, 0, len(payloads))
+	for idx, pl := range payloads {
+		item := map[string]interface{}{
+			"index":        idx,
+			"payload_type": int(pl.Type()),
+			"payload_name": payloadTypeName(pl.Type()),
+		}
+		if b, err := pl.Encode(); err == nil {
+			item["payload_len"] = len(b)
+			item["payload_hex"] = fmt.Sprintf("%x", b)
+		}
+		switch v := pl.(type) {
+		case *ikev2.EncryptedPayloadNotify:
+			item["notify_type"] = int(v.NotifyType)
+			item["notify_name"] = ikev2.NotifyTypeToString(v.NotifyType)
+			item["notify_data_len"] = len(v.NotifyData)
+			item["notify_data_hex"] = fmt.Sprintf("%x", v.NotifyData)
+		case *ikev2.EncryptedPayloadEAP:
+			item["eap_len"] = len(v.EAPMessage)
+			item["eap_hex"] = fmt.Sprintf("%x", v.EAPMessage)
+		}
+		details = append(details, item)
+	}
+
+	s.Logger.Debug(title,
+		logger.Uint32("msgid", msgID),
+		logger.Int("exchange", int(exchangeType)),
+		logger.Int("payload_count", len(payloads)),
+		logger.Any("payloads", details))
+}
+
+func payloadTypeName(t ikev2.PayloadType) string {
+	switch t {
+	case ikev2.SA:
+		return "SA"
+	case ikev2.KE:
+		return "KE"
+	case ikev2.IDi:
+		return "IDi"
+	case ikev2.IDr:
+		return "IDr"
+	case ikev2.AUTH:
+		return "AUTH"
+	case ikev2.NiNr:
+		return "NiNr"
+	case ikev2.N:
+		return "N"
+	case ikev2.D:
+		return "D"
+	case ikev2.V:
+		return "V"
+	case ikev2.TSI:
+		return "TSi"
+	case ikev2.TSR:
+		return "TSr"
+	case ikev2.SK:
+		return "SK"
+	case ikev2.CP:
+		return "CP"
+	case ikev2.EAP:
+		return "EAP"
+	case ikev2.EncryptedFragment:
+		return "SKF"
+	case ikev2.NoNextPayload:
+		return "NoNextPayload"
+	default:
+		return fmt.Sprintf("unknown(%d)", t)
+	}
 }
 
 func (s *Session) parsePayloads(data []byte, firstType ikev2.PayloadType) ([]ikev2.Payload, error) {

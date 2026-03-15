@@ -3,6 +3,7 @@ package crypto
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/des"
 	"crypto/rand"
 	"errors"
 	"io"
@@ -55,6 +56,88 @@ func (e *aesCBC) Decrypt(ciphertext []byte, key []byte, iv []byte, aad []byte) (
 		return nil, errors.New("密文未对齐块")
 	}
 
+	plaintext := make([]byte, len(ciphertext))
+	mode := cipher.NewCBCDecrypter(block, iv)
+	mode.CryptBlocks(plaintext, ciphertext)
+	return plaintext, nil
+}
+
+// DES-CBC
+type desCBC struct{}
+
+func (e *desCBC) IVSize() int    { return des.BlockSize }
+func (e *desCBC) BlockSize() int { return des.BlockSize }
+func (e *desCBC) KeySize() int   { return 8 }
+
+func (e *desCBC) Encrypt(plaintext []byte, key []byte, iv []byte, aad []byte) ([]byte, error) {
+	if len(key) != e.KeySize() {
+		return nil, errors.New("DES 密钥长度错误")
+	}
+	block, err := des.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	if len(plaintext)%des.BlockSize != 0 {
+		return nil, errors.New("明文未对齐块")
+	}
+	ciphertext := make([]byte, len(plaintext))
+	mode := cipher.NewCBCEncrypter(block, iv)
+	mode.CryptBlocks(ciphertext, plaintext)
+	return ciphertext, nil
+}
+
+func (e *desCBC) Decrypt(ciphertext []byte, key []byte, iv []byte, aad []byte) ([]byte, error) {
+	if len(key) != e.KeySize() {
+		return nil, errors.New("DES 密钥长度错误")
+	}
+	block, err := des.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	if len(ciphertext)%des.BlockSize != 0 {
+		return nil, errors.New("密文未对齐块")
+	}
+	plaintext := make([]byte, len(ciphertext))
+	mode := cipher.NewCBCDecrypter(block, iv)
+	mode.CryptBlocks(plaintext, ciphertext)
+	return plaintext, nil
+}
+
+// 3DES-CBC
+type tripleDESCBC struct{}
+
+func (e *tripleDESCBC) IVSize() int    { return des.BlockSize }
+func (e *tripleDESCBC) BlockSize() int { return des.BlockSize }
+func (e *tripleDESCBC) KeySize() int   { return 24 }
+
+func (e *tripleDESCBC) Encrypt(plaintext []byte, key []byte, iv []byte, aad []byte) ([]byte, error) {
+	if len(key) != e.KeySize() {
+		return nil, errors.New("3DES 密钥长度错误")
+	}
+	block, err := des.NewTripleDESCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	if len(plaintext)%des.BlockSize != 0 {
+		return nil, errors.New("明文未对齐块")
+	}
+	ciphertext := make([]byte, len(plaintext))
+	mode := cipher.NewCBCEncrypter(block, iv)
+	mode.CryptBlocks(ciphertext, plaintext)
+	return ciphertext, nil
+}
+
+func (e *tripleDESCBC) Decrypt(ciphertext []byte, key []byte, iv []byte, aad []byte) ([]byte, error) {
+	if len(key) != e.KeySize() {
+		return nil, errors.New("3DES 密钥长度错误")
+	}
+	block, err := des.NewTripleDESCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	if len(ciphertext)%des.BlockSize != 0 {
+		return nil, errors.New("密文未对齐块")
+	}
 	plaintext := make([]byte, len(ciphertext))
 	mode := cipher.NewCBCDecrypter(block, iv)
 	mode.CryptBlocks(plaintext, ciphertext)
@@ -133,6 +216,10 @@ func GetEncrypterWithKeyLen(id uint16, keyLenBits int) (Encrypter, error) {
 	switch id {
 	case 12: // AES_CBC
 		return &aesCBC{keySize: keySize}, nil
+	case 3: // 3DES
+		return &tripleDESCBC{}, nil
+	case 2: // DES
+		return &desCBC{}, nil
 	case 18, 19, 20: // AES_GCM_8/12/16
 		return &aesGCM{icvSize: 16, keySize: keySize}, nil
 	default:

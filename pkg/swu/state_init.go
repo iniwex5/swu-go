@@ -65,10 +65,17 @@ func (s *Session) buildIKESAInitPacket() ([]byte, error) {
 	}
 
 	// 使用配置驱动的 IKE Proposal；为空时回退到内置大兼容集合。
-	proposals, err := buildIKEProposals(s.cfg.IKEProposals, nil)
+	proposals, offeredProfiles, effectiveAlgSet, err := buildIKEProposals(s.cfg, nil, s.ikeProfileOffset)
 	if err != nil {
 		return nil, err
 	}
+	s.offeredIKEProfiles = append([]string(nil), offeredProfiles...)
+	s.effectiveCipherPolicy = buildAlgorithmPlan(s.cfg).policyLabel()
+	s.Logger.Info("IKE SA_INIT 提议画像",
+		logger.Int("retry_profile", s.ikeProfileOffset),
+		logger.Any("offered_alg_set", s.offeredIKEProfiles),
+		logger.Any("effective_alg_set", effectiveAlgSet),
+		logger.String("effective_cipher_policy", s.effectiveCipherPolicy))
 
 	if s.DH != nil {
 		// 这是重试协商的情况（e.g. 处理了 INVALID_KE_PAYLOAD）
@@ -283,7 +290,11 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 			}
 			// 检查错误，如 NO_PROPOSAL_CHOSEN
 			if v.NotifyType == 14 { // NO_PROPOSAL_CHOSEN
-				return errors.New("服务器拒绝了提议 (NO_PROPOSAL_CHOSEN)")
+				return &NegotiationError{
+					Class:     ErrClassAlgorithmCapabilityMismatch,
+					Reason:    "服务器拒绝了提议 (NO_PROPOSAL_CHOSEN)",
+					Retryable: true,
+				}
 			}
 			// RFC 5685: REDIRECT
 			if v.NotifyType == ikev2.REDIRECT {
@@ -441,15 +452,42 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 		}
 	}
 
+	plan := buildAlgorithmPlan(s.cfg)
+	if !plan.allowsEncryption(ikev2.AlgorithmType(encrID)) {
+		s.Logger.Warn("IKE SA 选定算法被本地策略拦截",
+			logger.String("selected_alg", ikev2.EncrToString(encrID)),
+			logger.String("selected_but_blocked_reason", "policy_rejected"),
+			logger.String("effective_cipher_policy", plan.policyLabel()))
+		return &NegotiationError{
+			Class:     ErrClassAlgorithmPolicyRejected,
+			Reason:    fmt.Sprintf("selected_encr=%s 被策略拒绝", ikev2.EncrToString(encrID)),
+			Retryable: true,
+		}
+	}
+
 	// 设置加密实例
 	s.PRFAlg, err = crypto.GetPRF(prfID)
 	if err != nil {
-		return fmt.Errorf("选择了不支持的 PRF: %d", prfID)
+		s.Logger.Warn("IKE SA 选定 PRF 超出本地能力",
+			logger.String("selected_alg", ikev2.PRFToString(prfID)),
+			logger.String("selected_but_blocked_reason", "prf_not_supported"))
+		return &NegotiationError{
+			Class:     ErrClassAlgorithmCapabilityMismatch,
+			Reason:    fmt.Sprintf("选择了不支持的 PRF: %d", prfID),
+			Retryable: true,
+		}
 	}
 
 	s.EncAlg, err = crypto.GetEncrypterWithKeyLen(encrID, encrKeyLenBits)
 	if err != nil {
-		return fmt.Errorf("选择了不支持的 Encr: %d", encrID)
+		s.Logger.Warn("IKE SA 选定加密算法超出本地能力",
+			logger.String("selected_alg", ikev2.EncrToString(encrID)),
+			logger.String("selected_but_blocked_reason", "encr_not_supported"))
+		return &NegotiationError{
+			Class:     ErrClassAlgorithmCapabilityMismatch,
+			Reason:    fmt.Sprintf("选择了不支持的 Encr: %d", encrID),
+			Retryable: true,
+		}
 	}
 	s.ikeEncrID = encrID
 	s.ikePRFID = prfID
@@ -462,7 +500,14 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 		s.ikeIntegID = integID
 		s.IntegAlg, err = crypto.GetIntegrityAlgorithm(integID)
 		if err != nil {
-			return fmt.Errorf("选择了不支持的 Integ: %d", integID)
+			s.Logger.Warn("IKE SA 选定完整性算法超出本地能力",
+				logger.String("selected_alg", ikev2.IntegToString(integID)),
+				logger.String("selected_but_blocked_reason", "integ_not_supported"))
+			return &NegotiationError{
+				Class:     ErrClassAlgorithmCapabilityMismatch,
+				Reason:    fmt.Sprintf("选择了不支持的 Integ: %d", integID),
+				Retryable: true,
+			}
 		}
 	}
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/iniwex5/swu-go/pkg/crypto"
 	"github.com/iniwex5/swu-go/pkg/ikev2"
 )
 
@@ -27,34 +28,254 @@ type encrSpec struct {
 	aead   bool
 }
 
-func buildIKEProposals(cfg []string, spi []byte) ([]*ikev2.Proposal, error) {
-	if len(cfg) == 0 {
-		return ikev2.CreateMultiProposalIKE(spi), nil
-	}
-	props := make([]*ikev2.Proposal, 0, len(cfg))
-	for i, raw := range cfg {
-		p, err := parseIKEProposal(raw, uint8(i+1), spi)
-		if err != nil {
-			return nil, err
+func buildIKEProposals(cfg *Config, spi []byte, profileOffset int) ([]*ikev2.Proposal, []string, []string, error) {
+	plan := buildAlgorithmPlan(cfg)
+	var source []*ikev2.Proposal
+
+	if len(cfg.IKEProposals) == 0 {
+		source = ikev2.CreateMultiProposalIKE(spi)
+	} else {
+		source = make([]*ikev2.Proposal, 0, len(cfg.IKEProposals))
+		for i, raw := range cfg.IKEProposals {
+			p, err := parseIKEProposal(raw, uint8(i+1), spi, plan)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			source = append(source, p)
 		}
-		props = append(props, p)
+	}
+
+	if profileOffset > 0 && profileOffset < len(source) {
+		source = source[profileOffset:]
+	}
+	if len(source) == 0 {
+		return nil, nil, nil, fmt.Errorf("无可用 IKE 提议(profile_offset=%d)", profileOffset)
+	}
+
+	props, profiles := filterIKEProposals(source)
+	if len(props) == 0 {
+		return nil, nil, nil, fmt.Errorf("IKE 提议经过能力过滤后为空")
+	}
+	return props, profiles, plan.effectiveAlgSetLabel(), nil
+}
+
+func buildESPProposals(cfg *Config, spi []byte) ([]*ikev2.Proposal, error) {
+	plan := buildAlgorithmPlan(cfg)
+	var source []*ikev2.Proposal
+
+	if len(cfg.ESPProposals) == 0 {
+		source = ikev2.CreateMultiProposalESP(spi)
+	} else {
+		source = make([]*ikev2.Proposal, 0, len(cfg.ESPProposals))
+		for i, raw := range cfg.ESPProposals {
+			p, err := parseESPProposal(raw, uint8(i+1), spi, plan)
+			if err != nil {
+				return nil, err
+			}
+			source = append(source, p)
+		}
+	}
+
+	props := make([]*ikev2.Proposal, 0, len(source))
+	for _, p := range source {
+		fp, ok := filterESPProposal(p)
+		if ok {
+			props = append(props, fp)
+		}
+	}
+	if len(props) == 0 {
+		return nil, fmt.Errorf("ESP 提议经过能力过滤后为空")
 	}
 	return props, nil
 }
 
-func buildESPProposals(cfg []string, spi []byte) ([]*ikev2.Proposal, error) {
-	if len(cfg) == 0 {
-		return ikev2.CreateMultiProposalESP(spi), nil
-	}
-	props := make([]*ikev2.Proposal, 0, len(cfg))
-	for i, raw := range cfg {
-		p, err := parseESPProposal(raw, uint8(i+1), spi)
-		if err != nil {
-			return nil, err
+func filterIKEProposals(source []*ikev2.Proposal) ([]*ikev2.Proposal, []string) {
+	props := make([]*ikev2.Proposal, 0, len(source))
+	profiles := make([]string, 0, len(source))
+	for idx, p := range source {
+		fp, ok := filterIKEProposal(p)
+		if !ok {
+			continue
 		}
-		props = append(props, p)
+		fp.ProposalNum = uint8(len(props) + 1)
+		props = append(props, fp)
+		profiles = append(profiles, summarizeIKEProposal(fp, idx+1))
 	}
-	return props, nil
+	return props, profiles
+}
+
+func filterIKEProposal(p *ikev2.Proposal) (*ikev2.Proposal, bool) {
+	fp := cloneProposal(p)
+	transforms := make([]*ikev2.Transform, 0, len(fp.Transforms))
+
+	hasEncr := false
+	hasPRF := false
+	hasInteg := false
+	hasDH := false
+	hasNonAEADEncr := false
+
+	for _, t := range fp.Transforms {
+		switch t.Type {
+		case ikev2.TransformTypeEncr:
+			keyBits := 0
+			for _, a := range t.Attributes {
+				if a.Type == ikev2.AttributeKeyLength {
+					keyBits = int(a.Val)
+					break
+				}
+			}
+			if !supportedByCryptoFactory(uint16(t.ID), keyBits) {
+				continue
+			}
+			transforms = append(transforms, cloneTransform(t))
+			hasEncr = true
+			if !isAEADEncryption(t.ID) {
+				hasNonAEADEncr = true
+			}
+		case ikev2.TransformTypePRF:
+			if _, err := crypto.GetPRF(uint16(t.ID)); err != nil {
+				continue
+			}
+			transforms = append(transforms, cloneTransform(t))
+			hasPRF = true
+		case ikev2.TransformTypeInteg:
+			if _, err := crypto.GetIntegrityAlgorithm(uint16(t.ID)); err != nil {
+				continue
+			}
+			transforms = append(transforms, cloneTransform(t))
+			hasInteg = true
+		case ikev2.TransformTypeDH:
+			if _, err := crypto.NewDiffieHellman(uint16(t.ID)); err != nil {
+				continue
+			}
+			transforms = append(transforms, cloneTransform(t))
+			hasDH = true
+		default:
+			transforms = append(transforms, cloneTransform(t))
+		}
+	}
+
+	if !hasEncr || !hasPRF || !hasDH {
+		return nil, false
+	}
+	if hasNonAEADEncr && !hasInteg {
+		return nil, false
+	}
+
+	fp.Transforms = transforms
+	return fp, true
+}
+
+func filterESPProposal(p *ikev2.Proposal) (*ikev2.Proposal, bool) {
+	fp := cloneProposal(p)
+	transforms := make([]*ikev2.Transform, 0, len(fp.Transforms))
+
+	hasEncr := false
+	hasInteg := false
+	hasNonAEADEncr := false
+
+	for _, t := range fp.Transforms {
+		switch t.Type {
+		case ikev2.TransformTypeEncr:
+			keyBits := 0
+			for _, a := range t.Attributes {
+				if a.Type == ikev2.AttributeKeyLength {
+					keyBits = int(a.Val)
+					break
+				}
+			}
+			if !supportedByCryptoFactory(uint16(t.ID), keyBits) {
+				continue
+			}
+			transforms = append(transforms, cloneTransform(t))
+			hasEncr = true
+			if !isAEADEncryption(t.ID) {
+				hasNonAEADEncr = true
+			}
+		case ikev2.TransformTypeInteg:
+			if _, err := crypto.GetIntegrityAlgorithm(uint16(t.ID)); err != nil {
+				continue
+			}
+			transforms = append(transforms, cloneTransform(t))
+			hasInteg = true
+		default:
+			transforms = append(transforms, cloneTransform(t))
+		}
+	}
+
+	if !hasEncr {
+		return nil, false
+	}
+	if hasNonAEADEncr && !hasInteg {
+		return nil, false
+	}
+
+	fp.Transforms = transforms
+	return fp, true
+}
+
+func cloneProposal(p *ikev2.Proposal) *ikev2.Proposal {
+	cp := *p
+	cp.SPI = append([]byte(nil), p.SPI...)
+	cp.Transforms = make([]*ikev2.Transform, 0, len(p.Transforms))
+	for _, t := range p.Transforms {
+		cp.Transforms = append(cp.Transforms, cloneTransform(t))
+	}
+	return &cp
+}
+
+func cloneTransform(t *ikev2.Transform) *ikev2.Transform {
+	ct := *t
+	ct.Attributes = make([]*ikev2.TransformAttribute, 0, len(t.Attributes))
+	for _, attr := range t.Attributes {
+		if attr == nil {
+			continue
+		}
+		ca := *attr
+		ca.Value = append([]byte(nil), attr.Value...)
+		ct.Attributes = append(ct.Attributes, &ca)
+	}
+	return &ct
+}
+
+func summarizeIKEProposal(p *ikev2.Proposal, idx int) string {
+	encr := ""
+	integ := ""
+	prf := ""
+	dh := ""
+	for _, t := range p.Transforms {
+		switch t.Type {
+		case ikev2.TransformTypeEncr:
+			if encr == "" {
+				encr = ikev2.EncrToString(uint16(t.ID))
+			}
+		case ikev2.TransformTypeInteg:
+			if integ == "" {
+				integ = ikev2.IntegToString(uint16(t.ID))
+			}
+		case ikev2.TransformTypePRF:
+			if prf == "" {
+				prf = ikev2.PRFToString(uint16(t.ID))
+			}
+		case ikev2.TransformTypeDH:
+			if dh == "" {
+				dh = ikev2.DHToString(uint16(t.ID))
+			}
+		}
+	}
+	if integ == "" {
+		integ = "AEAD"
+	}
+	if encr == "" {
+		encr = "UNKNOWN"
+	}
+	if prf == "" {
+		prf = "UNKNOWN"
+	}
+	if dh == "" {
+		dh = "UNKNOWN"
+	}
+	return fmt.Sprintf("p%d:%s-%s-%s-%s", idx, strings.ToLower(encr), strings.ToLower(integ), strings.ToLower(prf), strings.ToLower(dh))
 }
 
 func firstDHGroupFromProposals(props []*ikev2.Proposal) ikev2.AlgorithmType {
@@ -68,17 +289,31 @@ func firstDHGroupFromProposals(props []*ikev2.Proposal) ikev2.AlgorithmType {
 	return ikev2.MODP_2048_bit
 }
 
-func parseIKEProposal(raw string, num uint8, spi []byte) (*ikev2.Proposal, error) {
+func parseIKEProposal(raw string, num uint8, spi []byte, plan algorithmPlan) (*ikev2.Proposal, error) {
 	s := normalizeProposal(raw)
 	if s == "" {
 		return nil, fmt.Errorf("empty IKE proposal")
 	}
 	if s == "sunriselegacyandroid" {
 		prop := ikev2.NewProposal(num, ikev2.ProtoIKE, spi)
+		if plan.policy == AlgorithmPolicyLegacyPrefer {
+			if plan.allowsEncryption(ikev2.ENCR_3DES) {
+				prop.AddTransform(ikev2.TransformTypeEncr, ikev2.ENCR_3DES, 0)
+			}
+			if plan.allowsEncryption(ikev2.ENCR_DES) {
+				prop.AddTransform(ikev2.TransformTypeEncr, ikev2.ENCR_DES, 0)
+			}
+		}
 		prop.AddTransformWithKeyLen(ikev2.TransformTypeEncr, ikev2.ENCR_AES_CBC, 128)
 		prop.AddTransformWithKeyLen(ikev2.TransformTypeEncr, ikev2.ENCR_AES_CBC, 256)
-		prop.AddTransform(ikev2.TransformTypeEncr, ikev2.ENCR_3DES, 0)
-		prop.AddTransform(ikev2.TransformTypeEncr, ikev2.ENCR_DES, 0)
+		if plan.policy != AlgorithmPolicyLegacyPrefer {
+			if plan.allowsEncryption(ikev2.ENCR_3DES) {
+				prop.AddTransform(ikev2.TransformTypeEncr, ikev2.ENCR_3DES, 0)
+			}
+			if plan.allowsEncryption(ikev2.ENCR_DES) {
+				prop.AddTransform(ikev2.TransformTypeEncr, ikev2.ENCR_DES, 0)
+			}
+		}
 		prop.AddTransform(ikev2.TransformTypeInteg, ikev2.AUTH_HMAC_SHA1_96, 0)
 		prop.AddTransform(ikev2.TransformTypePRF, ikev2.PRF_HMAC_SHA1, 0)
 		prop.AddTransform(ikev2.TransformTypeDH, ikev2.MODP_1024_bit, 0)
@@ -93,6 +328,9 @@ func parseIKEProposal(raw string, num uint8, spi []byte) (*ikev2.Proposal, error
 	encr, err := parseEncr(parts[0])
 	if err != nil {
 		return nil, fmt.Errorf("invalid IKE proposal %q: %w", raw, err)
+	}
+	if !plan.allowsEncryption(encr.alg) {
+		return nil, fmt.Errorf("invalid IKE proposal %q: encryption %s rejected by policy", raw, ikev2.EncrToString(uint16(encr.alg)))
 	}
 
 	prop := ikev2.NewProposal(num, ikev2.ProtoIKE, spi)
@@ -153,7 +391,7 @@ func parseIKEProposal(raw string, num uint8, spi []byte) (*ikev2.Proposal, error
 	return prop, nil
 }
 
-func parseESPProposal(raw string, num uint8, spi []byte) (*ikev2.Proposal, error) {
+func parseESPProposal(raw string, num uint8, spi []byte, plan algorithmPlan) (*ikev2.Proposal, error) {
 	s := normalizeProposal(raw)
 	if s == "" {
 		return nil, fmt.Errorf("empty ESP proposal")
@@ -166,6 +404,9 @@ func parseESPProposal(raw string, num uint8, spi []byte) (*ikev2.Proposal, error
 	encr, err := parseEncr(parts[0])
 	if err != nil {
 		return nil, fmt.Errorf("invalid ESP proposal %q: %w", raw, err)
+	}
+	if !plan.allowsEncryption(encr.alg) {
+		return nil, fmt.Errorf("invalid ESP proposal %q: encryption %s rejected by policy", raw, ikev2.EncrToString(uint16(encr.alg)))
 	}
 
 	prop := ikev2.NewProposal(num, ikev2.ProtoESP, spi)

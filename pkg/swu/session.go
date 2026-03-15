@@ -25,7 +25,7 @@ import (
 
 // SA 生命周期常量（秒）
 const (
-	ikeRekeyInterval   = 1500 // 6 分钟：主动 IKE SA Rekey
+	ikeRekeyInterval   = 5000 // 约 83 分钟：主动 IKE SA Rekey（先拉长观察稳定性）
 	childRekeyInterval = 1800 // 7 分钟：主动 Child SA Rekey（在 ePDG ~8 分钟 ESP SA 过期前）
 	ikeRekeyJitter     = 30   // 最大 30 秒随机 jitter，避免多设备同时 IKE Rekey (对标 strongSwan margintime)
 	childRekeyJitter   = 30   // 最大 30 秒随机 jitter，避免多设备同时 Child SA Rekey
@@ -125,7 +125,7 @@ type Session struct {
 	lastEncryptedMsgID uint32
 
 	// RFC 4187 AT_CHECKCODE: 累积 EAP-AKA Identity 往返报文，供 Challenge 阶段计算校验码。
-	akaIdentityTranscript  [][]byte
+	eapTranscript          [][]byte
 	ikeIdentity            string
 	eapIdentity            string
 	eapSuccessReceived     bool
@@ -162,6 +162,12 @@ type Session struct {
 
 	statusMu       sync.RWMutex
 	terminalErrMsg string
+
+	// 协商可观测性
+	offeredIKEProfiles       []string
+	effectiveCipherPolicy    string
+	negotiationFallbackCount int
+	ikeProfileOffset         int
 }
 
 func (s *Session) setTerminalError(err error) {
@@ -318,9 +324,10 @@ func (s *Session) Connect(ctx context.Context) error {
 // connectOnce 执行一次完整的 IKE 连接流程
 func (s *Session) connectOnce() error {
 	handshakeStart := time.Now()
+	s.ikeProfileOffset = 0
 	var err error
 	s.eapSuccessReceived = false
-	s.akaIdentityTranscript = nil
+	s.eapTranscript = nil
 
 	s.Logger.Debug("初始化滑动窗口队列任务调度器 TaskManager", logger.Int("windowSize", 5))
 
@@ -425,6 +432,21 @@ func (s *Session) connectOnce() error {
 			if err := s.handleIKESAInitResp(respData); err != nil {
 				if errors.Is(err, ErrCookieRequired) {
 					continue
+				}
+				var nerr *NegotiationError
+				if errors.As(err, &nerr) && nerr.Retryable {
+					if s.advanceIKEProfileOffset() {
+						s.Logger.Warn("IKE SA_INIT 协商失败，切换候选画像重试",
+							logger.String("error_class", nerr.Class),
+							logger.String("reason", nerr.Reason),
+							logger.Int("retry_profile", s.ikeProfileOffset),
+							logger.Int("fallback_count", s.negotiationFallbackCount))
+						s.SPIr = 0
+						s.nr = nil
+						s.msgBuffer = nil
+						s.Keys = nil
+						continue
+					}
 				}
 				// RFC 7296 §2.6.1: 服务器拒绝了我们的 DH Group，用期望的群组重建 DH 并重发
 				var keErr *ErrInvalidKEGroup
@@ -682,6 +704,20 @@ func (s *Session) connectOnce() error {
 		return err
 	}
 	return s.ctx.Err()
+}
+
+func (s *Session) advanceIKEProfileOffset() bool {
+	maxProfiles := len(s.cfg.IKEProposals)
+	if maxProfiles == 0 {
+		// 默认内建 Multi-Proposal 当前为 4 档；保守写死以避免重新构造触发副作用。
+		maxProfiles = 4
+	}
+	if s.ikeProfileOffset+1 >= maxProfiles {
+		return false
+	}
+	s.ikeProfileOffset++
+	s.negotiationFallbackCount++
+	return true
 }
 
 // Reauthenticate 触发完全重认证 (RFC 7296 §2.8.3)
@@ -1376,7 +1412,11 @@ func (s *Session) setupXFRMDataPlane() error {
 	if isAEAD {
 		aeadInfo, err := driver.IKEv2AlgToXFRMAead(s.childEncrID, s.childEncrKeyLenBits)
 		if err != nil {
-			return fmt.Errorf("映射 AEAD 算法失败: %v", err)
+			return &NegotiationError{
+				Class:     ErrClassDriverUnsupported,
+				Reason:    fmt.Sprintf("映射 AEAD 算法失败: %v", err),
+				Retryable: false,
+			}
 		}
 		outSACfg.AeadAlgoName = aeadInfo.Name
 		outSACfg.AeadKey = s.ChildSAOut.EncryptionKey // 包含 encKey + salt
@@ -1388,11 +1428,19 @@ func (s *Session) setupXFRMDataPlane() error {
 	} else {
 		cryptInfo, err := driver.IKEv2AlgToXFRMCrypt(s.childEncrID, s.childEncrKeyLenBits)
 		if err != nil {
-			return fmt.Errorf("映射加密算法失败: %v", err)
+			return &NegotiationError{
+				Class:     ErrClassDriverUnsupported,
+				Reason:    fmt.Sprintf("映射加密算法失败: %v", err),
+				Retryable: false,
+			}
 		}
 		authInfo, err := driver.IKEv2AlgToXFRMAuth(s.childIntegID)
 		if err != nil {
-			return fmt.Errorf("映射完整性算法失败: %v", err)
+			return &NegotiationError{
+				Class:     ErrClassDriverUnsupported,
+				Reason:    fmt.Sprintf("映射完整性算法失败: %v", err),
+				Retryable: false,
+			}
 		}
 		outSACfg.CryptAlgoName = cryptInfo.Name
 		outSACfg.CryptKey = s.ChildSAOut.EncryptionKey
@@ -1631,7 +1679,11 @@ func (s *Session) rekeyXFRMSA(oldOutSPI, oldInSPI uint32, newSAOut, newSAIn *ips
 	if isAEAD {
 		aeadInfo, err := driver.IKEv2AlgToXFRMAead(encrID, encrKeyLenBits)
 		if err != nil {
-			return fmt.Errorf("Rekey 映射 AEAD 算法失败: %v", err)
+			return &NegotiationError{
+				Class:     ErrClassDriverUnsupported,
+				Reason:    fmt.Sprintf("Rekey 映射 AEAD 算法失败: %v", err),
+				Retryable: false,
+			}
 		}
 		outSACfg.AeadAlgoName = aeadInfo.Name
 		outSACfg.AeadKey = newSAOut.EncryptionKey
@@ -1643,11 +1695,19 @@ func (s *Session) rekeyXFRMSA(oldOutSPI, oldInSPI uint32, newSAOut, newSAIn *ips
 	} else {
 		cryptInfo, err := driver.IKEv2AlgToXFRMCrypt(encrID, encrKeyLenBits)
 		if err != nil {
-			return fmt.Errorf("Rekey 映射加密算法失败: %v", err)
+			return &NegotiationError{
+				Class:     ErrClassDriverUnsupported,
+				Reason:    fmt.Sprintf("Rekey 映射加密算法失败: %v", err),
+				Retryable: false,
+			}
 		}
 		authInfo, err := driver.IKEv2AlgToXFRMAuth(s.childIntegID)
 		if err != nil {
-			return fmt.Errorf("Rekey 映射完整性算法失败: %v", err)
+			return &NegotiationError{
+				Class:     ErrClassDriverUnsupported,
+				Reason:    fmt.Sprintf("Rekey 映射完整性算法失败: %v", err),
+				Retryable: false,
+			}
 		}
 		outSACfg.CryptAlgoName = cryptInfo.Name
 		outSACfg.CryptKey = newSAOut.EncryptionKey

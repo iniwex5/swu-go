@@ -100,6 +100,54 @@ func TestAESCBCEncryptDecrypt(t *testing.T) {
 	}
 }
 
+func TestDESEncryptDecrypt(t *testing.T) {
+	enc, err := GetEncrypter(2) // ENCR_DES
+	if err != nil {
+		t.Fatalf("获取 DES 加密器失败: %v", err)
+	}
+	key := []byte("12345678")
+	plaintext := []byte("DESBLOCK")
+	iv, err := RandomBytes(enc.IVSize())
+	if err != nil {
+		t.Fatalf("生成 IV 失败: %v", err)
+	}
+	ciphertext, err := enc.Encrypt(plaintext, key, iv, nil)
+	if err != nil {
+		t.Fatalf("DES 加密失败: %v", err)
+	}
+	decrypted, err := enc.Decrypt(ciphertext, key, iv, nil)
+	if err != nil {
+		t.Fatalf("DES 解密失败: %v", err)
+	}
+	if !bytes.Equal(plaintext, decrypted) {
+		t.Fatalf("DES 解密结果不匹配: got=%x want=%x", decrypted, plaintext)
+	}
+}
+
+func TestTripleDESEncryptDecrypt(t *testing.T) {
+	enc, err := GetEncrypter(3) // ENCR_3DES
+	if err != nil {
+		t.Fatalf("获取 3DES 加密器失败: %v", err)
+	}
+	key := []byte("123456789012345678901234")
+	plaintext := []byte("TRIPLED!") // 8-byte aligned
+	iv, err := RandomBytes(enc.IVSize())
+	if err != nil {
+		t.Fatalf("生成 IV 失败: %v", err)
+	}
+	ciphertext, err := enc.Encrypt(plaintext, key, iv, nil)
+	if err != nil {
+		t.Fatalf("3DES 加密失败: %v", err)
+	}
+	decrypted, err := enc.Decrypt(ciphertext, key, iv, nil)
+	if err != nil {
+		t.Fatalf("3DES 解密失败: %v", err)
+	}
+	if !bytes.Equal(plaintext, decrypted) {
+		t.Fatalf("3DES 解密结果不匹配: got=%x want=%x", decrypted, plaintext)
+	}
+}
+
 // TestRandomBytes 测试随机字节生成
 func TestRandomBytes(t *testing.T) {
 	b1, err := RandomBytes(32)

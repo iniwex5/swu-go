@@ -78,4 +78,16 @@ type Config struct {
 	// 示例：[]string{"aes256gcm16-prfsha384-ecp384", "aes128-sha256-modp2048"}
 	IKEProposals []string
 	ESPProposals []string
+
+	// 兼容 legacy 算法（DES/3DES）控制：
+	// 默认 false，仅在明确配置时才允许进入有效协商集合。
+	EnableLegacyCiphers bool
+	// 白名单，仅当 EnableLegacyCiphers=true 时生效。可选: "3des", "des"。
+	// 为空时默认允许二者。
+	AllowedLegacyCiphers []string
+	// 算法策略:
+	// - strict: 仅现代算法，忽略 legacy 开关
+	// - balanced: 默认，modern 优先，legacy 仅显式开启
+	// - legacy_prefer: legacy 优先（用于排障/极端兼容）
+	AlgorithmPolicy string
 }

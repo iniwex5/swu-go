@@ -265,7 +265,11 @@ func (s *Session) fillSAKeys(cfg *driver.XFRMSAConfig, sa *ipsec.SecurityAssocia
 	if isAEAD {
 		aeadInfo, err := driver.IKEv2AlgToXFRMAead(s.childEncrID, s.childEncrKeyLenBits)
 		if err != nil {
-			return err
+			return &NegotiationError{
+				Class:     ErrClassDriverUnsupported,
+				Reason:    fmt.Sprintf("MOBIKE 映射 AEAD 算法失败: %v", err),
+				Retryable: false,
+			}
 		}
 		cfg.AeadAlgoName = aeadInfo.Name
 		cfg.AeadKey = sa.EncryptionKey
@@ -273,11 +277,19 @@ func (s *Session) fillSAKeys(cfg *driver.XFRMSAConfig, sa *ipsec.SecurityAssocia
 	} else {
 		cryptInfo, err := driver.IKEv2AlgToXFRMCrypt(s.childEncrID, s.childEncrKeyLenBits)
 		if err != nil {
-			return err
+			return &NegotiationError{
+				Class:     ErrClassDriverUnsupported,
+				Reason:    fmt.Sprintf("MOBIKE 映射加密算法失败: %v", err),
+				Retryable: false,
+			}
 		}
 		authInfo, err := driver.IKEv2AlgToXFRMAuth(s.childIntegID)
 		if err != nil {
-			return err
+			return &NegotiationError{
+				Class:     ErrClassDriverUnsupported,
+				Reason:    fmt.Sprintf("MOBIKE 映射完整性算法失败: %v", err),
+				Retryable: false,
+			}
 		}
 		cfg.CryptAlgoName = cryptInfo.Name
 		cfg.CryptKey = sa.EncryptionKey

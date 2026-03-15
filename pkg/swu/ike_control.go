@@ -44,6 +44,11 @@ func (s *Session) ikeDispatchLoop() {
 			// 更新入站时间戳
 			s.lastInboundTime = time.Now()
 
+			// 全量记录入站 IKE 原始包，便于逐包对比运营商/ePDG行为。
+			// s.Logger.Debug("收到 IKE 原始回包",
+			// 	logger.Int("len", len(data)),
+			// 	logger.String("raw_hex", fmt.Sprintf("%x", data)))
+
 			hdr, err := ikev2.DecodeHeader(data)
 			if err != nil {
 				continue

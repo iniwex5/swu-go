@@ -34,6 +34,16 @@ func IKEv2AlgToXFRMCrypt(ikeAlgID uint16, keyLenBits int) (*XFRMCryptAlgo, error
 	}
 
 	switch ikeAlgID {
+	case 2: // ENCR_DES
+		return &XFRMCryptAlgo{
+			Name:    "cbc(des)",
+			KeyBits: 64,
+		}, nil
+	case 3: // ENCR_3DES
+		return &XFRMCryptAlgo{
+			Name:    "cbc(des3_ede)",
+			KeyBits: 192,
+		}, nil
 	case 12: // ENCR_AES_CBC
 		return &XFRMCryptAlgo{
 			Name:    "cbc(aes)",
