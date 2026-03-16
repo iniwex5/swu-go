@@ -545,8 +545,9 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 			logger.String("hex", fmt.Sprintf("%x", encodedResp)))
 
 		if hasNotifCode && eap.IsFailureNotificationCode(notifCode) {
-			return nil, fmt.Errorf("EAP 认证被拒绝 (AT_NOTIFICATION=%d: %s)",
-				notifCode, eap.NotificationCodeToString(notifCode))
+			s.Logger.Warn("EAP-AKA Notification 指示失败语义，已回 ACK 并继续等待后续 EAP 消息",
+				logger.Int("notification_code", int(notifCode)),
+				logger.String("meaning", eap.NotificationCodeToString(notifCode)))
 		}
 
 		eapPayload := &ikev2.EncryptedPayloadEAP{EAPMessage: encodedResp}

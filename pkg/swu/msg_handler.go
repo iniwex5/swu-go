@@ -153,6 +153,13 @@ func (s *Session) logParsedIKEPayloads(title string, exchangeType ikev2.Exchange
 		case *ikev2.EncryptedPayloadEAP:
 			item["eap_len"] = len(v.EAPMessage)
 			item["eap_hex"] = fmt.Sprintf("%x", v.EAPMessage)
+		case *ikev2.RawPayload:
+			// CERT/CERTREQ payload body: [1-byte cert encoding][payload data...]
+			// 这里补充结构化字段，便于日志中快速判断服务端是否要求证书。
+			if (v.PType == ikev2.CERT || v.PType == ikev2.CERTREQ) && len(v.Data) > 0 {
+				item["cert_encoding"] = int(v.Data[0])
+				item["cert_data_len"] = len(v.Data) - 1
+			}
 		}
 		details = append(details, item)
 	}
@@ -176,6 +183,10 @@ func payloadTypeName(t ikev2.PayloadType) string {
 		return "IDr"
 	case ikev2.AUTH:
 		return "AUTH"
+	case ikev2.CERT:
+		return "CERT"
+	case ikev2.CERTREQ:
+		return "CERTREQ"
 	case ikev2.NiNr:
 		return "NiNr"
 	case ikev2.N:
