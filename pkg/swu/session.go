@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"strings"
 	"sync/atomic"
 
 	"sync"
@@ -704,6 +705,9 @@ func (s *Session) connectOnce() error {
 		err = ErrReauth
 	}
 
+	// 先关闭数据面入口，避免 socket 释放后 TUN->ESP 继续发包刷屏。
+	s.stopDataPlane()
+
 	if err != ErrReauth {
 		// 仅在非 Reauth（正常关闭）时发送 Delete
 		if err := s.sendDeleteIKE(); err != nil {
@@ -717,6 +721,16 @@ func (s *Session) connectOnce() error {
 		return err
 	}
 	return s.ctx.Err()
+}
+
+func (s *Session) stopDataPlane() {
+	if s.tun == nil {
+		return
+	}
+	if err := s.tun.Close(); err != nil {
+		s.Logger.Debug("关闭 TUN 失败", logger.Err(err))
+	}
+	s.tun = nil
 }
 
 func (s *Session) advanceIKEProfileOffset() bool {
@@ -2050,6 +2064,18 @@ func (s *Session) startDataPlaneLoop() {
 			}
 
 			if err := s.socket.SendESP(espPacket); err != nil {
+				if s.ctx != nil {
+					select {
+					case <-s.ctx.Done():
+						s.Logger.Debug("会话关闭，停止 TUN->ESP 循环")
+						return
+					default:
+					}
+				}
+				if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
+					s.Logger.Debug("数据面 socket 已关闭，停止 TUN->ESP 循环")
+					return
+				}
 				s.Logger.Warn("ESP 发送失败", logger.Err(err), logger.String("dstIP", dstIP))
 				continue
 			}

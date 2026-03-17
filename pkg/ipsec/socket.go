@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -326,6 +327,9 @@ func (s *SocketManager) SendESP(data []byte) error {
 	// 接收方通过 SPI != 0 来区分 ESP 和 IKE
 	n, err := s.Conn.WriteToUDP(packet, &dst)
 	if err != nil {
+		if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
+			return err
+		}
 		logger.Warn("ESP 发送失败", logger.Err(err), logger.String("dst", dst.String()), logger.Int("len", len(packet)))
 	} else if n != len(packet) {
 		logger.Warn("ESP 发送不完整", logger.Int("sent", n), logger.Int("expected", len(packet)))
