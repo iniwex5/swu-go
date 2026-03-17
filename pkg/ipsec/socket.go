@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/iniwex5/swu-go/pkg/ikev2"
 	"github.com/iniwex5/swu-go/pkg/logger"
 )
@@ -68,9 +70,29 @@ func NewSocketManager(deviceID, local, remote string, dnsServer string) (*Socket
 		return nil, err
 	}
 
-	conn, err := net.ListenUDP(network, lAddr)
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var err error
+			c.Control(func(fd uintptr) {
+				// SO_REUSEADDR
+				err = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+				if err != nil {
+					return
+				}
+				// SO_REUSEPORT (Linux 3.9+)
+				err = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+			})
+			return err
+		},
+	}
+
+	pc, err := lc.ListenPacket(context.Background(), network, lAddr.String())
 	if err != nil {
 		return nil, err
+	}
+	conn, ok := pc.(*net.UDPConn)
+	if !ok {
+		return nil, fmt.Errorf("underlying connection is not UDPConn")
 	}
 
 	if actual, ok := conn.LocalAddr().(*net.UDPAddr); ok {
@@ -317,8 +339,11 @@ func (s *SocketManager) SendNATKeepalive() error {
 	s.remoteMu.Unlock()
 	_, err := s.Conn.WriteToUDP([]byte{0xff}, &dst)
 	if err != nil {
-		// 捕捉 operation not permitted 这类 OS 级阻塞
-		logger.Warn("NAT keepalive 发送遭遇操作系统级拦截/拒绝", logger.Err(err), logger.String("dst", dst.String()), logger.String("local", s.LocalAddrString()))
+		// 捕捉 operation not permitted / use of closed network connection 这类 OS 级阻塞，但在尚未正常建立时不要疯狂刷屏
+		errStr := err.Error()
+		if !errors.Is(err, net.ErrClosed) && errStr != "use of closed network connection" {
+			logger.Warn("NAT keepalive 发送遭遇操作系统级拦截/拒绝", logger.Err(err), logger.String("dst", dst.String()), logger.String("local", s.LocalAddrString()))
+		}
 	}
 	return err
 }

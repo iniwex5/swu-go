@@ -44,8 +44,8 @@ type OutgoingMessage struct {
 	NextTimeout time.Duration
 	Deadline    time.Time
 
-	// 信号通知通道：如果成功，把收到的解密包推入；如果彻底超时抛出 nil 关闭通道
 	CompletionCh chan []byte
+	isClosed     bool // 防止多次调用 close(CompletionCh) 导致 panic
 }
 
 // TaskManager 用于接管原有的线性重试池，支撑滑动窗口概念 (Window Size)
@@ -182,10 +182,16 @@ func (tm *TaskManager) windowLoop() {
 			// 终止通知：清理所有频道
 			tm.mu.Lock()
 			for _, m := range tm.pending {
-				close(m.CompletionCh)
+				if !m.isClosed {
+					close(m.CompletionCh)
+					m.isClosed = true
+				}
 			}
 			for _, m := range tm.queue {
-				close(m.CompletionCh)
+				if !m.isClosed {
+					close(m.CompletionCh)
+					m.isClosed = true
+				}
 			}
 			tm.pending = make(map[uint32]*OutgoingMessage)
 			tm.queue = nil
@@ -213,7 +219,10 @@ func (tm *TaskManager) checkTimeouts() {
 				// 已死，打捞并踢下线
 				logger.Warn("IKE 请求遭遇硬超时，剔除 Window", logger.Uint32("msgID", id))
 				toDelete = append(toDelete, id)
-				close(msg.CompletionCh)
+				if !msg.isClosed {
+					close(msg.CompletionCh)
+					msg.isClosed = true
+				}
 			} else {
 				// 惩罚增长并执行再次空投
 				msg.RetryCount++

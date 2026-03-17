@@ -68,6 +68,7 @@ type Session struct {
 	childESN            bool   // Child SA 是否使用 ESN (扩展序列号)
 
 	natKeepaliveStarted bool
+	natDetected         bool
 
 	// strongSwan 风格时间戳——用于自适应 keepalive / DPD 按需检测
 	lastInboundTime  time.Time // 最后收到入站 IKE/ESP 包的时间
@@ -328,11 +329,12 @@ func (s *Session) connectOnce() error {
 	var err error
 	s.eapSuccessReceived = false
 	s.eapTranscript = nil
+	s.natDetected = false
 
 	s.Logger.Debug("初始化滑动窗口队列任务调度器 TaskManager", logger.Int("windowSize", 5))
 
 	// 在 Socket 启动前暂不配置 sendFunc，等到下面 socket.Start() 之后重载
-	s.taskMgr = NewTaskManager(s.ctx, s.cfg.DeviceID, nil, 5, nil)
+	s.taskMgr = NewTaskManager(s.ctx, s.cfg.DeviceID, s.cfg.IKERetryConfig, 5, nil)
 
 	// 1. 设置网络 (Socket)
 	localPort := s.cfg.LocalPort
@@ -348,6 +350,7 @@ func (s *Session) connectOnce() error {
 	} else {
 		s.socket, err = ipsec.NewSocketManager(s.cfg.DeviceID, localBind, remoteAddr, s.cfg.DNSServer)
 		if err != nil && localPort != 0 {
+			s.Logger.Warn("绑定指定端口失败，退后到随机高位端口", logger.Int("port", int(localPort)), logger.Err(err))
 			localBind = fmt.Sprintf("%s:%d", s.cfg.LocalAddr, 0)
 			s.socket, err = ipsec.NewSocketManager(s.cfg.DeviceID, localBind, remoteAddr, s.cfg.DNSServer)
 		}
@@ -625,6 +628,16 @@ func (s *Session) connectOnce() error {
 
 	s.Logger.Info("会话已建立", logger.Duration("handshake", time.Since(handshakeStart)))
 
+	// NAT keepalive 在 CHILD_SA 建立后再启动，避免在握手阶段提前发送探活包。
+	if s.natDetected {
+		natKeepalive := s.cfg.NATKeepaliveSeconds
+		if natKeepalive <= 0 {
+			natKeepalive = 20
+		}
+		s.startNATKeepalive(time.Duration(natKeepalive) * time.Second)
+		s.Logger.Debug("NAT keepalive 已启动（隧道建立后）", logger.Int("interval_seconds", natKeepalive))
+	}
+
 	if s.cfg.EnableDriver {
 		if s.cfg.DataplaneMode == "xfrmi" {
 			// XFRMI 模式: 使用内核 XFRM offload
@@ -846,10 +859,9 @@ func (s *Session) startNetEventMonitor() {
 					}
 				case ipsec.EventNetworkDown:
 					// ICMP Host/Net Unreachable，提前触发生态保护，绕开死等 keepalive
-					s.Logger.Warn("基站/路由器发来链路断开 ICMP (Host Unreachable)，触发 DPD/MOBIKE 预判探活",
-						logger.String("reason", ev.Reason))
 					// 直接发起一次 DPD 加速验证，如果在发 DPD 期间发生漂移将直接救活。
 					if s.Keys == nil || s.EncAlg == nil {
+						s.Logger.Debug("基站/路由器发来链路断开 ICMP，但处于建联早期，推迟 DPD 探活", logger.String("reason", ev.Reason))
 						now := time.Now()
 						if preKeyFirstSeen.IsZero() || now.Sub(preKeyFirstSeen) > preKeyUnreachWindow {
 							preKeyFirstSeen = now

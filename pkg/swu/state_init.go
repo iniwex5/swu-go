@@ -381,16 +381,12 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 		expNatDst := ikev2.CalculateNATDetectionHash(s.SPIi, s.SPIr, remoteIP, remotePort)
 
 		natDetected := !bytes.Equal(natSrc, expNatSrc) || !bytes.Equal(natDst, expNatDst)
+		s.natDetected = natDetected
 		if natDetected {
 			if setter, ok := s.socket.(interface{ SetRemotePort(int) }); ok {
 				setter.SetRemotePort(4500)
 			}
-			natKeepalive := s.cfg.NATKeepaliveSeconds
-			if natKeepalive <= 0 {
-				natKeepalive = 20
-			}
-			s.startNATKeepalive(time.Duration(natKeepalive) * time.Second)
-			s.Logger.Debug("检测到 NAT，切换到 UDP 4500")
+			s.Logger.Debug("检测到 NAT，切换到 UDP 4500；NAT keepalive 将在隧道建立后启动")
 		}
 	}
 

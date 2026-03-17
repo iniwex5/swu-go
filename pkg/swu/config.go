@@ -24,6 +24,8 @@ type Config struct {
 	MCC       string
 	MNC       string
 	LocalPort uint16 // 本地 UDP 端口 (默认 500)
+	// IKE 请求重传参数（可选）。为 nil 时使用默认重传策略。
+	IKERetryConfig *RetryConfig
 	// IKE SA 重认证间隔（秒），0 表示禁用
 	// 默认 0 (不主动重认证，仅 Rekey)
 	ReauthInterval int
