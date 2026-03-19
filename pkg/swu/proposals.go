@@ -294,31 +294,6 @@ func parseIKEProposal(raw string, num uint8, spi []byte, plan algorithmPlan) (*i
 	if s == "" {
 		return nil, fmt.Errorf("empty IKE proposal")
 	}
-	if s == "sunriselegacyandroid" {
-		prop := ikev2.NewProposal(num, ikev2.ProtoIKE, spi)
-		if plan.policy == AlgorithmPolicyLegacyPrefer {
-			if plan.allowsEncryption(ikev2.ENCR_3DES) {
-				prop.AddTransform(ikev2.TransformTypeEncr, ikev2.ENCR_3DES, 0)
-			}
-			if plan.allowsEncryption(ikev2.ENCR_DES) {
-				prop.AddTransform(ikev2.TransformTypeEncr, ikev2.ENCR_DES, 0)
-			}
-		}
-		prop.AddTransformWithKeyLen(ikev2.TransformTypeEncr, ikev2.ENCR_AES_CBC, 128)
-		prop.AddTransformWithKeyLen(ikev2.TransformTypeEncr, ikev2.ENCR_AES_CBC, 256)
-		if plan.policy != AlgorithmPolicyLegacyPrefer {
-			if plan.allowsEncryption(ikev2.ENCR_3DES) {
-				prop.AddTransform(ikev2.TransformTypeEncr, ikev2.ENCR_3DES, 0)
-			}
-			if plan.allowsEncryption(ikev2.ENCR_DES) {
-				prop.AddTransform(ikev2.TransformTypeEncr, ikev2.ENCR_DES, 0)
-			}
-		}
-		prop.AddTransform(ikev2.TransformTypeInteg, ikev2.AUTH_HMAC_SHA1_96, 0)
-		prop.AddTransform(ikev2.TransformTypePRF, ikev2.PRF_HMAC_SHA1, 0)
-		prop.AddTransform(ikev2.TransformTypeDH, ikev2.MODP_1024_bit, 0)
-		return prop, nil
-	}
 
 	parts := strings.Split(s, "-")
 	if len(parts) != 3 && len(parts) != 4 {
