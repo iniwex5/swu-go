@@ -114,22 +114,6 @@ func NewSocketManager(deviceID, local, remote string, dnsServer string) (*Socket
 }
 
 func resolveUDPAddrAll(addr string, dnsServer string) (*net.UDPAddr, []net.IP, error) {
-	if dnsServer == "" {
-		r, err := net.ResolveUDPAddr("udp", addr)
-		if err != nil {
-			return nil, nil, err
-		}
-		if r.IP != nil {
-			return r, []net.IP{r.IP}, nil
-		}
-		return r, nil, nil
-	}
-
-	if dnsServer == "" {
-		r, err := net.ResolveUDPAddr("udp", addr)
-		return r, nil, err
-	}
-
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, nil, err
@@ -143,17 +127,25 @@ func resolveUDPAddrAll(addr string, dnsServer string) (*net.UDPAddr, []net.IP, e
 		return &net.UDPAddr{IP: ip, Port: port}, []net.IP{ip}, nil
 	}
 
-	res := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{}
-			return d.DialContext(ctx, "udp", dnsServer)
-		},
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	ips, err := res.LookupIPAddr(ctx, host)
+	lookupServer := strings.TrimSpace(dnsServer)
+	var resolver *net.Resolver
+	if lookupServer == "" {
+		// 默认走系统 DNS（/etc/resolv.conf / 系统网络栈），同时保留全量 A/AAAA 结果用于 ePDG 失败切换。
+		resolver = net.DefaultResolver
+	} else {
+		resolver = &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				d := net.Dialer{}
+				return d.DialContext(ctx, "udp", lookupServer)
+			},
+		}
+	}
+
+	ips, err := resolver.LookupIPAddr(ctx, host)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -162,17 +154,26 @@ func resolveUDPAddrAll(addr string, dnsServer string) (*net.UDPAddr, []net.IP, e
 	}
 
 	var remoteIPs []net.IP
+	seen := make(map[string]struct{}, len(ips))
 	for _, cand := range ips {
 		if cand.IP == nil {
 			continue
 		}
+		key := cand.IP.String()
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
 		remoteIPs = append(remoteIPs, cand.IP)
+	}
+	if len(remoteIPs) == 0 {
+		return nil, nil, errors.New("DNS 未返回可用 IP")
 	}
 
 	ip := remoteIPs[0]
-	for _, cand := range ips {
-		if cand.IP.To4() != nil {
-			ip = cand.IP
+	for _, cand := range remoteIPs {
+		if cand.To4() != nil {
+			ip = cand
 			break
 		}
 	}
