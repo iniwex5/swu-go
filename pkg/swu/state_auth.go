@@ -67,6 +67,51 @@ func shouldEchoATCheckcode(value []byte) bool {
 	return len(value) > 2
 }
 
+const akaPrimePRFLabel = "EAP-AKA'"
+
+func akaPrimeKeySeed(identity string) []byte {
+	seed := make([]byte, 0, len(akaPrimePRFLabel)+len(identity))
+	seed = append(seed, []byte(akaPrimePRFLabel)...)
+	seed = append(seed, []byte(identity)...)
+	return seed
+}
+
+func shouldIncludeChallengeMetaByMode(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "echo", "checkcode", "recalc", "recompute":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Session) resolveATCheckcodeValue(mode string, eapType uint8, hasCheckcode bool, serverValue []byte, shouldEcho bool) []byte {
+	if !hasCheckcode {
+		return nil
+	}
+
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "recalc", "recompute":
+		hashType := "sha1"
+		if eapType == eap.TypeAKAPrime {
+			hashType = "sha256"
+		}
+		checkcode := s.calcAKACheckcode(hashType)
+		if len(checkcode) == 0 {
+			return nil
+		}
+		value := make([]byte, 2+len(checkcode))
+		copy(value[2:], checkcode)
+		return value
+	case "echo", "checkcode":
+		if shouldEcho {
+			return append([]byte(nil), serverValue...)
+		}
+	}
+
+	return nil
+}
+
 // calcAKACheckcode 计算 EAP-AKA/AKA' 的 AT_CHECKCODE。
 // RFC 4187 §10.13: 覆盖直到本包为止的所有 EAP-Request/Response 报文（按传输顺序）。
 func (s *Session) calcAKACheckcode(hashType string) []byte {
@@ -111,7 +156,7 @@ func (s *Session) currentEAPIdentity() string {
 		return s.cfg.FastReauthID
 	}
 	imsi, _ := s.cfg.SIM.GetIMSI()
-	return buildAKAIdentity(imsi, s.cfg)
+	return buildInitialEAPIdentity(imsi, s.cfg)
 }
 
 func (s *Session) buildIKEAuthInitPayloads() ([]ikev2.Payload, error) {
@@ -390,7 +435,7 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 				logger.String("reauthID", identity))
 		} else {
 			imsi, _ := s.cfg.SIM.GetIMSI()
-			identity = buildAKAIdentity(imsi, s.cfg)
+			identity = buildInitialEAPIdentity(imsi, s.cfg)
 		}
 		s.eapIdentity = identity
 
@@ -743,32 +788,35 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		atRes := &eap.Attribute{Type: eap.AT_RES, Value: resValue}
 		respAttrs = append(respAttrs, atRes.Encode()...)
 
-		// 服务端 AT_CHECKCODE 原样回显缓存（严格回显）
-		var echoedCheckcodeValue []byte
-		chMode := strings.ToLower(s.cfg.AKAChallengeMode)
+		// 服务端 AT_CHECKCODE 缓存（按模式回显或重算）
+		var emittedCheckcodeValue []byte
+		var serverCheckcodeValue []byte
+		if hasCheckcode && atCheckcode != nil {
+			serverCheckcodeValue = atCheckcode.Value
+		}
+		chMode := strings.ToLower(strings.TrimSpace(s.cfg.AKAChallengeMode))
 
 		// 检查配置，决定是否附加 AT_RESULT_IND, AT_CHECKCODE 等属性
-			if chMode == "echo" || chMode == "checkcode" {
-				if hasResultInd {
-					// RFC 4187 §10.14: 值字段为空（长度为 1，即仅有 Header）
-					atResultIndAttr := &eap.Attribute{Type: eap.AT_RESULT_IND, Value: make([]byte, 2)}
-					respAttrs = append(respAttrs, atResultIndAttr.Encode()...)
-				}
-				if shouldEchoCheckcode {
-					// 严格回显服务端下发的 AT_CHECKCODE（含 Reserved 字段），不做本地重算。
-					echoedCheckcodeValue = append([]byte(nil), atCheckcode.Value...)
-					atCheckcodeAttr := &eap.Attribute{Type: eap.AT_CHECKCODE, Value: echoedCheckcodeValue}
-					respAttrs = append(respAttrs, atCheckcodeAttr.Encode()...)
-				}
+		if shouldIncludeChallengeMetaByMode(chMode) {
+			if hasResultInd {
+				// RFC 4187 §10.14: 值字段为空（长度为 1，即仅有 Header）
+				atResultIndAttr := &eap.Attribute{Type: eap.AT_RESULT_IND, Value: make([]byte, 2)}
+				respAttrs = append(respAttrs, atResultIndAttr.Encode()...)
 			}
+			emittedCheckcodeValue = s.resolveATCheckcodeValue(chMode, eap.TypeAKA, hasCheckcode, serverCheckcodeValue, shouldEchoCheckcode)
+			if len(emittedCheckcodeValue) > 0 {
+				atCheckcodeAttr := &eap.Attribute{Type: eap.AT_CHECKCODE, Value: emittedCheckcodeValue}
+				respAttrs = append(respAttrs, atCheckcodeAttr.Encode()...)
+			}
+		}
 
 		// AT_MAC (占位 16 字节零)
 		respMacAttr := &eap.Attribute{Type: eap.AT_MAC, Value: make([]byte, 18)}
 		respAttrs = append(respAttrs, respMacAttr.Encode()...)
 
 		var checkcodeDigest string
-		if len(echoedCheckcodeValue) > 0 {
-			checkcodeDigest = eapAttrDigest(echoedCheckcodeValue)
+		if len(emittedCheckcodeValue) > 0 {
+			checkcodeDigest = eapAttrDigest(emittedCheckcodeValue)
 		}
 		respAttrTypes := listEAPAttrTypes(respAttrs)
 		s.Logger.Info("EAP-AKA Challenge Response 属性摘要",
@@ -1026,8 +1074,10 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 			mkHash.Write(ckPrime)
 			mkTry := mkHash.Sum(nil) // 32 bytes
 
-			// 从 MK 派生 K_encr(16) + K_aut(32) + K_re(32) + MSK(64) + EMSK(64) 共 208 字节
-			keyMat := prf256Plus(mkTry, 208)
+			// RFC 5448 §3.4:
+			// K_encr||K_aut||K_re||MSK||EMSK = PRF'(MK, "EAP-AKA'"|Identity)
+			keySeed := akaPrimeKeySeed(idVar)
+			keyMat := prf256Plus(mkTry, keySeed, 208)
 			kEncrTry := keyMat[:16]  // 16 字节 (K_encr)
 			kAutTry := keyMat[16:48] // 32 字节 (HMAC-SHA-256 密钥)
 			mskTry := keyMat[80:144] // 64 字节
@@ -1080,24 +1130,27 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		atRes := &eap.Attribute{Type: eap.AT_RES, Value: resValue}
 		respAttrs = append(respAttrs, atRes.Encode()...)
 
-		// 服务端 AT_CHECKCODE 原样回显缓存（严格回显）
-		var echoedCheckcodeValue []byte
-		chMode := strings.ToLower(s.cfg.AKAChallengeMode)
+		// 服务端 AT_CHECKCODE 缓存（按模式回显或重算）
+		var emittedCheckcodeValue []byte
+		var serverCheckcodeValue []byte
+		if hasCheckcode && atCheckcode != nil {
+			serverCheckcodeValue = atCheckcode.Value
+		}
+		chMode := strings.ToLower(strings.TrimSpace(s.cfg.AKAChallengeMode))
 
 		// 检查配置，决定是否附加 AT_RESULT_IND, AT_CHECKCODE 等属性
-			if chMode == "echo" || chMode == "checkcode" {
-				if hasResultInd {
-					// RFC 4187 §10.14: 值字段为空（长度为 1，即仅有 Header）
-					atResultIndAttr := &eap.Attribute{Type: eap.AT_RESULT_IND, Value: make([]byte, 2)}
-					respAttrs = append(respAttrs, atResultIndAttr.Encode()...)
-				}
-				if shouldEchoCheckcode {
-					// 严格回显服务端下发的 AT_CHECKCODE（含 Reserved 字段），不做本地重算。
-					echoedCheckcodeValue = append([]byte(nil), atCheckcode.Value...)
-					atCheckcodeAttr := &eap.Attribute{Type: eap.AT_CHECKCODE, Value: echoedCheckcodeValue}
-					respAttrs = append(respAttrs, atCheckcodeAttr.Encode()...)
-				}
+		if shouldIncludeChallengeMetaByMode(chMode) {
+			if hasResultInd {
+				// RFC 4187 §10.14: 值字段为空（长度为 1，即仅有 Header）
+				atResultIndAttr := &eap.Attribute{Type: eap.AT_RESULT_IND, Value: make([]byte, 2)}
+				respAttrs = append(respAttrs, atResultIndAttr.Encode()...)
 			}
+			emittedCheckcodeValue = s.resolveATCheckcodeValue(chMode, eap.TypeAKAPrime, hasCheckcode, serverCheckcodeValue, shouldEchoCheckcode)
+			if len(emittedCheckcodeValue) > 0 {
+				atCheckcodeAttr := &eap.Attribute{Type: eap.AT_CHECKCODE, Value: emittedCheckcodeValue}
+				respAttrs = append(respAttrs, atCheckcodeAttr.Encode()...)
+			}
+		}
 
 		// AT_KDF (回显协商的 KDF ID)
 		kdfVal := make([]byte, 2)
@@ -1113,8 +1166,8 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		// 现在所有属性均组装完毕，计算包含本待发包信息的 Checkcode
 		// 此时 MAC 位置的数据是全零，满足 Checkcode 计算要求。
 		var checkcodeDigest string
-		if len(echoedCheckcodeValue) > 0 {
-			checkcodeDigest = eapAttrDigest(echoedCheckcodeValue)
+		if len(emittedCheckcodeValue) > 0 {
+			checkcodeDigest = eapAttrDigest(emittedCheckcodeValue)
 		}
 		respAttrTypes := listEAPAttrTypes(respAttrs)
 		s.Logger.Info("EAP-AKA' Challenge Response 属性摘要",
@@ -1265,8 +1318,13 @@ func (s *Session) handleEAP(eapRaw []byte) ([]ikev2.Payload, error) {
 		}
 
 		if !counterTooSmall {
-			// 关键差异：使用 prf256Plus (HMAC-SHA256) 代替 FIPS186-2 PRF (SHA-1) 派生 MSK
-			newKeyMat := prf256Plus(s.fastReauthCtx.MK, 16+32+32+64)
+			// AKA' 快速重认证路径沿用 PRF' 扩展方式，保持与全量 AKA' 密钥编排一致。
+			seedIdentity := strings.TrimSpace(s.fastReauthCtx.ReauthID)
+			if seedIdentity == "" {
+				seedIdentity = strings.TrimSpace(s.currentEAPIdentity())
+			}
+			keySeed := akaPrimeKeySeed(seedIdentity)
+			newKeyMat := prf256Plus(s.fastReauthCtx.MK, keySeed, 16+32+32+64)
 			// K_encr(16) + K_aut(32) + K_re(32) + MSK(64)
 			s.MSK = newKeyMat[80:144]
 		} else {
@@ -1885,14 +1943,17 @@ func (s *Session) handleIKEAuthFinalResp(data []byte) error {
 	return nil
 }
 
-// prf256Plus 实现 RFC 5448 §3.4 定义的 PRF+ 密钥扩展算法 (基于 HMAC-SHA-256)。
-// 输出 outLen 字节的密钥材料: T1 = HMAC-SHA256(key, 0x01) , T2 = HMAC-SHA256(key, T1 || 0x02) , ...
-func prf256Plus(key []byte, outLen int) []byte {
+// prf256Plus 实现 RFC 5448 §3.4 定义的 PRF' 扩展算法 (基于 HMAC-SHA-256)。
+// T1 = HMAC-SHA256(key, seed | 0x01)
+// T2 = HMAC-SHA256(key, T1 | seed | 0x02)
+// Tn = HMAC-SHA256(key, T(n-1) | seed | n)
+func prf256Plus(key, seed []byte, outLen int) []byte {
 	var result []byte
 	var prev []byte
 	for i := byte(1); len(result) < outLen; i++ {
 		h := hmac.New(sha256.New, key)
 		h.Write(prev)
+		h.Write(seed)
 		h.Write([]byte{i})
 		prev = h.Sum(nil)
 		result = append(result, prev...)

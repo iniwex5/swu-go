@@ -22,10 +22,10 @@ func (s *Session) decryptAndParse(data []byte) (uint32, []ikev2.Payload, error) 
 		if err != nil {
 			return header.MessageID, nil, fmt.Errorf("SKF 解密失败: %v", err)
 		}
-		s.Logger.Debug("收到 IKE 分片",
-			logger.Int("frag", int(fragNum)),
-			logger.Int("total", int(totalFrags)),
-			logger.Uint32("msgID", msgID))
+		// s.Logger.Debug("收到 IKE 分片",
+		// 	logger.Int("frag", int(fragNum)),
+		// 	logger.Int("total", int(totalFrags)),
+		// 	logger.Uint32("msgID", msgID))
 
 		complete, err := s.fragmentBuf.addFragment(msgID, fragNum, totalFrags, plaintext)
 		if err != nil {
@@ -48,7 +48,7 @@ func (s *Session) decryptAndParse(data []byte) (uint32, []ikev2.Payload, error) 
 		// SKF Generic Header 中的 NextPayload 指向重组后的第一个载荷
 		firstPayloadType := ikev2.PayloadType(data[ikev2.IKE_HEADER_LEN])
 		payloads, err := s.parsePayloads(reassembled, firstPayloadType)
-		s.logParsedIKEPayloads("IKE 分片重组 payload 明细", header.ExchangeType, msgID, payloads)
+		// s.logParsedIKEPayloads("IKE 分片重组 payload 明细", header.ExchangeType, msgID, payloads)
 		return msgID, payloads, err
 	}
 
@@ -57,7 +57,7 @@ func (s *Session) decryptAndParse(data []byte) (uint32, []ikev2.Payload, error) 
 		if err != nil || packet == nil {
 			return header.MessageID, nil, err
 		}
-		s.logParsedIKEPayloads("IKE 明文 payload 明细", header.ExchangeType, header.MessageID, packet.Payloads)
+		// s.logParsedIKEPayloads("IKE 明文 payload 明细", header.ExchangeType, header.MessageID, packet.Payloads)
 		return header.MessageID, packet.Payloads, nil
 	}
 
@@ -113,14 +113,14 @@ func (s *Session) decryptAndParse(data []byte) (uint32, []ikev2.Payload, error) 
 		}
 		plaintext = plaintext[:len(plaintext)-1-padLen]
 	}
-	s.Logger.Debug("IKE SK 解密明文",
-		logger.Uint32("msgid", header.MessageID),
-		logger.Int("exchange", int(header.ExchangeType)),
-		logger.Int("len", len(plaintext)),
-		logger.String("plaintext_hex", fmt.Sprintf("%x", plaintext)))
+	// s.Logger.Debug("IKE SK 解密明文",
+	// 	logger.Uint32("msgid", header.MessageID),
+	// 	logger.Int("exchange", int(header.ExchangeType)),
+	// 	logger.Int("len", len(plaintext)),
+	// 	logger.String("plaintext_hex", fmt.Sprintf("%x", plaintext)))
 
 	payloads, err := s.parsePayloads(plaintext, genHeader.NextPayload)
-	s.logParsedIKEPayloads("IKE SK payload 明细", header.ExchangeType, header.MessageID, payloads)
+	// s.logParsedIKEPayloads("IKE SK payload 明细", header.ExchangeType, header.MessageID, payloads)
 	return header.MessageID, payloads, err
 }
 

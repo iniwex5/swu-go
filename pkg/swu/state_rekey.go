@@ -142,11 +142,11 @@ func (s *Session) handleCreateChildSAResp(data []byte, niNonce []byte, newSPI ui
 	}
 
 	s.Logger.Info("Rekey 响应解密成功", logger.Int("payloadCount", len(payloads)))
-	for i, pl := range payloads {
-		s.Logger.Debug("Rekey 响应载荷",
-			logger.Int("index", i),
-			logger.String("type", fmt.Sprintf("%T", pl)))
-	}
+	// for i, pl := range payloads {
+	// 	s.Logger.Debug("Rekey 响应载荷",
+	// 		logger.Int("index", i),
+	// 		logger.String("type", fmt.Sprintf("%T", pl)))
+	// }
 
 	var respSA *ikev2.EncryptedPayloadSA
 	var respNonce []byte
