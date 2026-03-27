@@ -13,6 +13,18 @@ import (
 	"github.com/iniwex5/swu-go/pkg/logger"
 )
 
+type createChildSARejectError struct {
+	NotifyType uint16
+}
+
+func (e *createChildSARejectError) Error() string {
+	return fmt.Sprintf(
+		"CREATE_CHILD_SA 被拒绝，通知类型: %d(%s)",
+		e.NotifyType,
+		ikev2.NotifyTypeToString(e.NotifyType),
+	)
+}
+
 // RekeyChildSA 执行 CHILD_SA 密钥轮换 (CREATE_CHILD_SA 交换)
 // RFC 7296 1.3.3: 重新协商 CHILD_SA
 func (s *Session) RekeyChildSA() error {
@@ -184,7 +196,7 @@ func (s *Session) handleCreateChildSAResp(data []byte, niNonce []byte, newSPI ui
 			respKE = p.KEData
 		case *ikev2.EncryptedPayloadNotify:
 			if p.NotifyType < 16384 { // 错误通知
-				return fmt.Errorf("CREATE_CHILD_SA 被拒绝，通知类型: %d", p.NotifyType)
+				return &createChildSARejectError{NotifyType: p.NotifyType}
 			}
 		}
 	}

@@ -26,10 +26,10 @@ import (
 
 // SA 生命周期常量（秒）
 const (
-	ikeRekeyInterval   = 5000 // 约 83 分钟：主动 IKE SA Rekey（先拉长观察稳定性）
-	childRekeyInterval = 1800 // 7 分钟：主动 Child SA Rekey（在 ePDG ~8 分钟 ESP SA 过期前）
-	ikeRekeyJitter     = 30   // 最大 30 秒随机 jitter，避免多设备同时 IKE Rekey (对标 strongSwan margintime)
-	childRekeyJitter   = 30   // 最大 30 秒随机 jitter，避免多设备同时 Child SA Rekey
+	ikeRekeyInterval   = 5000 // 默认值（约 83 分钟）
+	childRekeyInterval = 1800 // 默认值（30 分钟）
+	ikeRekeyJitter     = 5    // 最大 5 秒随机 jitter，避免多设备同时 IKE Rekey
+	childRekeyJitter   = 10   // 最大 10 秒随机 jitter，避免多设备同时 Child SA Rekey
 )
 
 type Session struct {
@@ -92,13 +92,24 @@ type Session struct {
 	// 隧道断线回调（Hard Expire / DPD 连续失败时调用）
 	OnSessionDown func()
 
+	// OnReauthNeeded 在 Reauth 定时器到期时被调用，通知上层（Pool）预先创建新 Session。
+	// 上层应在此回调中启动新 Session 的建立流程。旧 Session 将在 reauthOverlapGrace 后退出。
+	// 如果为 nil，则回退到 Break-Before-Make 行为。
+	OnReauthNeeded func()
+
+	// reauthOverlapGrace 是 Make-Before-Break 模式下旧 Session 等待新 Session 建通的宽限期。
+	// 默认 10 秒。在此期间旧隧道的 ESP 数据面保持活跃。
+	reauthOverlapGrace time.Duration
+
 	// 代理重定向回调 (RFC 5685 REDIRECT 要求切换网关)
 	OnRedirect func(newAddr string)
 
 	// Rekey 互斥锁（防止两个 SPI 的 expire 同时触发）
 	rekeyMu sync.Mutex
-	// 上次成功 Rekey 的时间（用于冷却期去重）
+	// 上次成功 Child SA Rekey 的时间（用于冷却期去重）
 	lastRekeyTime time.Time
+	// 上次成功 IKE SA Rekey 的时间（独立冷却期，避免与 Child SA Rekey 互相干扰）
+	lastIKERekeyTime time.Time
 	// IKE SA Rekey 成功后通知 Timer 重置的 channel
 	rekeyResetCh chan struct{}
 	// Child SA Rekey 成功后通知 Timer 重置的 channel
@@ -676,16 +687,33 @@ func (s *Session) connectOnce() error {
 			logger.Duration("childRekey", childInterval))
 	}
 
+	s.Logger.Info("SA Rekey 定时器启动参数",
+		logger.Duration("childRekeyInterval", childInterval),
+		logger.Duration("ikeRekeyInterval", ikeInterval),
+		logger.Uint32("authLifetime", s.authLifetime))
+
 	// 启动 IKE SA 生命周期管理：定时触发 IKE SA Rekey
 	s.startIKESARekeyTimer(ikeInterval)
 
 	// 启动 Child SA 生命周期管理：定时触发 Child SA Rekey
+	// 与 IKE SA Rekey 交错 30 秒启动，避免两个 timer 同时到期产生冷却互锁
 	// 参考 strongSwan rekey_child_sa_job：在 ePDG ESP SA 过期前刷新
-	s.startChildSARekeyTimer(childInterval)
+	s.startChildSARekeyTimer(childInterval + 30*time.Second)
 
-	// 启动 Reauth Timer (如果配置了)
-	if s.cfg.ReauthInterval > 0 {
-		s.startIKEReauthTimer(time.Duration(s.cfg.ReauthInterval) * time.Second)
+	// 启动 Reauth Timer
+	// 优先使用 ePDG 声明的 AUTH_LIFETIME（减去 30 秒余量），否则回退到配置值
+	reauthSec := s.cfg.ReauthInterval
+	if s.authLifetime > 60 {
+		dynamicReauth := int(s.authLifetime) - 30
+		if reauthSec == 0 || dynamicReauth < reauthSec {
+			reauthSec = dynamicReauth
+			s.Logger.Info("根据 AUTH_LIFETIME 动态调整 Reauth 间隔",
+				logger.Uint32("authLifetime", s.authLifetime),
+				logger.Int("reauthInterval", reauthSec))
+		}
+	}
+	if reauthSec > 0 {
+		s.startIKEReauthTimer(time.Duration(reauthSec) * time.Second)
 	}
 
 	// 启动 XFRM SA Expire 内核事件监听（仅做日志+Hard Expire 处理）
@@ -696,8 +724,32 @@ func (s *Session) connectOnce() error {
 	case <-s.ctx.Done():
 		s.Logger.Info("收到关闭信号，正在清理")
 	case <-s.reauthTrigger:
-		s.Logger.Info("触发 IKE Reauthentication，正在断开旧连接")
-		// 发送 Delete 通知
+		s.Logger.Info("触发 IKE Reauthentication")
+
+		if s.OnReauthNeeded != nil {
+			// Make-Before-Break：先通知 Pool 预建新 Session，延迟关闭旧 Session
+			s.Logger.Info("Make-Before-Break: 通知上层预建新隧道，旧数据面保持运行")
+			go s.OnReauthNeeded()
+
+			// 等待宽限期，让新 Session 有时间完成握手
+			grace := s.reauthOverlapGrace
+			if grace <= 0 {
+				grace = 10 * time.Second
+			}
+			s.Logger.Info("Make-Before-Break: 旧隧道宽限期开始",
+				logger.Duration("grace", grace))
+			select {
+			case <-time.After(grace):
+				s.Logger.Info("Make-Before-Break: 宽限期结束，关闭旧隧道")
+			case <-s.ctx.Done():
+				s.Logger.Info("Make-Before-Break: 宽限期内收到关闭信号")
+			}
+		} else {
+			// Break-Before-Make 回退：直接发 Delete
+			s.Logger.Info("Break-Before-Make: 正在断开旧连接")
+		}
+
+		// 发送旧 IKE SA Delete 通知
 		if err := s.sendDeleteIKE(); err != nil {
 			s.Logger.Warn("发送 Delete 通知失败", logger.Err(err))
 		}
@@ -769,6 +821,8 @@ func (s *Session) startIKEReauthTimer(interval time.Duration) {
 			case <-s.ctx.Done():
 				return
 			case <-timer.C:
+				s.Logger.Info("IKE SA Reauth 定时器到期，触发全量重认证",
+					logger.Duration("actual_interval", interval+jitter))
 				s.Reauthenticate()
 				return
 			}
@@ -1064,8 +1118,16 @@ func (s *Session) startIKESARekeyTimer(interval time.Duration) {
 // 定期触发 CHILD_SA Rekey，在 ePDG ~8 分钟 ESP SA 过期前刷新密钥
 // 连续失败 rekeyMaxFail 次后触发隧道重建
 // 参考 strongSwan rekey_child_sa_job + jitter 机制
+func isChildSANotFoundError(err error) bool {
+	var rejectErr *createChildSARejectError
+	return errors.As(err, &rejectErr) && rejectErr.NotifyType == ikev2.CHILD_SA_NOT_FOUND
+}
+
 func (s *Session) startChildSARekeyTimer(interval time.Duration) {
-	const rekeyMaxFail = 2
+	const (
+		rekeyMaxFail    = 2
+		rekeyRetryAfter = 60 * time.Second
+	)
 
 	// 初始化 child rekey 重置 channel
 	s.childRekeyResetCh = make(chan struct{}, 1)
@@ -1073,10 +1135,19 @@ func (s *Session) startChildSARekeyTimer(interval time.Duration) {
 	go func() {
 		// 首次启动添加 jitter，避免多设备同时 Rekey
 		jitter := time.Duration(rand.Int63n(int64(childRekeyJitter))) * time.Second
-		timer := time.NewTimer(interval - jitter)
+		nextInterval := interval - jitter
+		timer := time.NewTimer(nextInterval)
 		defer timer.Stop()
 
 		failCount := 0
+		triggerSessionDown := func() {
+			if s.OnSessionDown != nil {
+				go s.OnSessionDown()
+			}
+			if s.cancel != nil {
+				s.cancel()
+			}
+		}
 
 		for {
 			select {
@@ -1092,34 +1163,42 @@ func (s *Session) startChildSARekeyTimer(interval time.Duration) {
 					}
 				}
 				jitter = time.Duration(rand.Int63n(int64(childRekeyJitter))) * time.Second
-				timer.Reset(interval - jitter)
+				nextInterval = interval - jitter
+				timer.Reset(nextInterval)
 				s.Logger.Debug("Child SA Rekey Timer 已重置",
-					logger.Duration("interval", interval-jitter))
+					logger.Duration("interval", nextInterval))
 			case <-timer.C:
 				s.Logger.Info("Child SA 生命周期到期，发起主动 Child SA Rekey",
-					logger.Duration("interval", interval))
+					logger.Duration("interval", nextInterval))
 				if err := s.RekeyChildSA(); err != nil {
 					failCount++
 					s.Logger.Warn("Child SA Rekey 失败",
 						logger.Err(err),
 						logger.Int("连续失败", failCount))
 
+					if isChildSANotFoundError(err) {
+						s.Logger.Error("Child SA Rekey 收到 CHILD_SA_NOT_FOUND，立即触发隧道重建",
+							logger.Int("notify_type", int(ikev2.CHILD_SA_NOT_FOUND)),
+							logger.String("notify_name", ikev2.NotifyTypeToString(ikev2.CHILD_SA_NOT_FOUND)))
+						triggerSessionDown()
+						return
+					}
+
 					if failCount >= rekeyMaxFail {
 						s.Logger.Error("Child SA Rekey 连续失败达上限，触发隧道重建",
 							logger.Int("maxFail", rekeyMaxFail))
-						if s.OnSessionDown != nil {
-							go s.OnSessionDown()
-						}
-						if s.cancel != nil {
-							s.cancel()
-						}
+						triggerSessionDown()
 						return
 					}
-					timer.Reset(60 * time.Second) // 失败后 1 分钟重试
+					nextInterval = rekeyRetryAfter
+					s.Logger.Warn("Child SA Rekey 将在短间隔后重试",
+						logger.Duration("retry_in", nextInterval))
+					timer.Reset(nextInterval)
 				} else {
 					failCount = 0
 					jitter = time.Duration(rand.Int63n(int64(childRekeyJitter))) * time.Second
-					timer.Reset(interval - jitter)
+					nextInterval = interval - jitter
+					timer.Reset(nextInterval)
 				}
 			}
 		}

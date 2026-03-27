@@ -22,10 +22,10 @@ func (s *Session) RekeyIKESA() error {
 		return errors.New("IKE SA 未建立，无法 Rekey")
 	}
 
-	// 冷却期检查
-	if !s.lastRekeyTime.IsZero() && time.Since(s.lastRekeyTime) < 30*time.Second {
+	// IKE SA Rekey 独立冷却期检查
+	if !s.lastIKERekeyTime.IsZero() && time.Since(s.lastIKERekeyTime) < 30*time.Second {
 		s.Logger.Debug("IKE Rekey 冷却期内，跳过",
-			logger.Duration("sinceLast", time.Since(s.lastRekeyTime)))
+			logger.Duration("sinceLast", time.Since(s.lastIKERekeyTime)))
 		return nil
 	}
 
@@ -204,7 +204,7 @@ func (s *Session) handleRekeyIKESAResp(
 		logger.Uint64("newSPIr", newSPIr))
 
 	// 更新冷却期时间戳
-	s.lastRekeyTime = time.Now()
+	s.lastIKERekeyTime = time.Now()
 
 	// 通知 Timer 重置
 	select {
@@ -337,7 +337,7 @@ func (s *Session) HandleRekeyIKESARequest(msgID uint32, payloads []ikev2.Payload
 	s.Keys = newKeys
 	s.SequenceNumber.Store(0)
 	s.DH = newDH
-	s.lastRekeyTime = time.Now()
+	s.lastIKERekeyTime = time.Now()
 	s.rekeyMu.Unlock()
 
 	s.Logger.Info("被动 IKE SA Rekey 完成，密钥已更新",

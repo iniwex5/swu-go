@@ -10,7 +10,7 @@ import (
 
 // sendDPD 发送 Dead Peer Detection 请求，返回的 err 仅指打包入列错误
 func (s *Session) sendDPD() error {
-	s.Logger.Debug("发送 DPD 请求 (通过并发窗口队列)")
+	// s.Logger.Debug("发送 DPD 请求 (通过并发窗口队列)")
 	// 滑动窗口已经接管了超时重试惩罚，这句 send 函数其实就是投信箱拿号过程。
 	_, err := s.sendEncryptedWithRetry(nil, ikev2.INFORMATIONAL)
 	return err
@@ -68,6 +68,10 @@ func (s *Session) sendDeleteChildSA(spis []uint32) error {
 //  1. 检查 lastInboundTime（入站时间差），有流量则跳过 DPD 请求
 //  2. DPD 发送由 sendEncryptedWithRetry 负责超时重传（5次/~165s）
 //  3. 重传耗尽 → 判定对端不可达，触发隧道重建
+//
+// 注意：DPD 响应的 FlagResponse 验证已在 ikeDispatchLoop 中隐式完成——
+// 只有携带 Response 标志且 MessageID 匹配的包才会通过 taskMgr.HandleResponse
+// 到达 sendEncryptedWithRetry 的 compCh，因此此处无需二次校验。
 func (s *Session) StartDPD(interval time.Duration) {
 	// 初始化入站时间戳
 	if s.lastInboundTime.IsZero() {
@@ -78,6 +82,8 @@ func (s *Session) StartDPD(interval time.Duration) {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
+		consecutiveFails := 0 // 连续 DPD 失败计数
+
 		for {
 			select {
 			case <-s.ctx.Done():
@@ -87,17 +93,26 @@ func (s *Session) StartDPD(interval time.Duration) {
 				diff := time.Since(s.lastInboundTime)
 				if diff < interval {
 					// 入站间隔内有流量，对端存活，无需 DPD
+					if consecutiveFails > 0 {
+						s.Logger.Debug("DPD 跳过（有入站流量），连续失败计数已重置",
+							logger.Int("was_fails", consecutiveFails))
+						consecutiveFails = 0
+					}
 					continue
 				}
 
 				// 超过 DPD 间隔无入站流量，发送 DPD 探测
-				s.Logger.Debug("发送 DPD 请求",
-					logger.Duration("lastInbound", diff))
+				dpdStart := time.Now()
+				// s.Logger.Debug("发送 DPD 请求",
+				// 	logger.Duration("lastInbound", diff),
+				// 	logger.Int("consecutive_fails", consecutiveFails))
 				if err := s.sendDPD(); err != nil {
+					consecutiveFails++
 					// sendDPD → sendEncryptedWithRetry 已经做了 5 次指数退避重传
 					// 到达这里说明 ~165s 内全部超时，判定对端不可达
 					s.Logger.Error("DPD 重传耗尽，判定对端不可达",
-						logger.Err(err))
+						logger.Err(err),
+						logger.Int("consecutive_fails", consecutiveFails))
 
 					// 暴力掐除：立即发送底层断线回调
 					if s.OnSessionDown != nil {
@@ -109,8 +124,12 @@ func (s *Session) StartDPD(interval time.Duration) {
 					}
 					return
 				}
-				// DPD 成功 → 更新入站时间戳
+				// DPD 成功 → 更新入站时间戳，记录 RTT
+				consecutiveFails = 0
+				rtt := time.Since(dpdStart)
 				s.lastInboundTime = time.Now()
+				s.Logger.Debug("DPD 探测成功",
+					logger.Duration("rtt", rtt))
 			}
 		}
 	}()
