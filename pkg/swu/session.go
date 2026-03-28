@@ -835,6 +835,17 @@ func (s *Session) WaitDone() {
 	<-s.done
 }
 
+// WaitDoneContext 与 WaitDone 相同，但额外接受 context 参数。
+// 若 ctx 在清理完成前取消，立即返回 ctx.Err()；清理正常完成返回 nil。
+func (s *Session) WaitDoneContext(ctx context.Context) error {
+	select {
+	case <-s.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (s *Session) cleanupNetworkConfig() {
 	s.Logger.Debug("开始清理网络配置", logger.Int("count", len(s.netUndos)))
 	for i := len(s.netUndos) - 1; i >= 0; i-- {
