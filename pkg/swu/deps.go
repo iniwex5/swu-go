@@ -1,6 +1,10 @@
 package swu
 
-import "github.com/iniwex5/swu-go/pkg/ipsec"
+import (
+	"net"
+
+	"github.com/iniwex5/swu-go/pkg/ipsec"
+)
 
 type Transport interface {
 	Start()
@@ -10,6 +14,15 @@ type Transport interface {
 	IKEPackets() <-chan []byte
 	ESPPackets() <-chan []byte
 	NetEventsChan() <-chan ipsec.NetEvent
+
+	// 地址信息方法：消除对 *ipsec.SocketManager 的类型断言依赖
+	LocalIP() net.IP
+	RemoteIP() net.IP
+	LocalPort() uint16
+	RemotePort() int
+	SetRemotePort(port int)
+	LocalAddrString() string
+	RemoteAddrString() string
 }
 
 type TUN interface {

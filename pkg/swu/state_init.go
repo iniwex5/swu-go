@@ -127,9 +127,7 @@ func (s *Session) buildIKESAInitPacket() ([]byte, error) {
 
 	localPort := s.cfg.LocalPort
 	if localPort == 0 {
-		if lp, ok := s.socket.(interface{ LocalPort() uint16 }); ok {
-			localPort = lp.LocalPort()
-		}
+		localPort = s.socket.LocalPort()
 	}
 	remoteIP := net.ParseIP(s.cfg.EpDGAddr).To4()
 	remotePort := s.cfg.EpDGPort
@@ -137,27 +135,19 @@ func (s *Session) buildIKESAInitPacket() ([]byte, error) {
 		remotePort = 500
 	}
 
-	if ep, ok := s.socket.(interface {
-		LocalIP() net.IP
-		RemoteIP() net.IP
-		RemotePort() int
-	}); ok {
-		if rip := ep.RemoteIP(); rip != nil {
-			if v4 := rip.To4(); v4 != nil {
-				remoteIP = v4
-			}
+	if rip := s.socket.RemoteIP(); rip != nil {
+		if v4 := rip.To4(); v4 != nil {
+			remoteIP = v4
 		}
-		if rp := ep.RemotePort(); rp != 0 {
-			remotePort = uint16(rp)
-		}
+	}
+	if rp := s.socket.RemotePort(); rp != 0 {
+		remotePort = uint16(rp)
 	}
 
 	localIP := net.ParseIP(s.cfg.LocalAddr).To4()
-	if ep, ok := s.socket.(interface{ LocalIP() net.IP }); ok {
-		if lip := ep.LocalIP(); lip != nil {
-			if v4 := lip.To4(); v4 != nil && !v4.Equal(net.IPv4zero) {
-				localIP = v4
-			}
+	if lip := s.socket.LocalIP(); lip != nil {
+		if v4 := lip.To4(); v4 != nil && !v4.Equal(net.IPv4zero) {
+			localIP = v4
 		}
 	}
 	if localIP == nil || localIP.Equal(net.IPv4zero) {
@@ -337,36 +327,26 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 	if len(natSrc) > 0 && len(natDst) > 0 {
 		localPort := s.cfg.LocalPort
 		if localPort == 0 {
-			if lp, ok := s.socket.(interface{ LocalPort() uint16 }); ok {
-				localPort = lp.LocalPort()
-			}
+			localPort = s.socket.LocalPort()
 		}
 		remoteIP := net.ParseIP(s.cfg.EpDGAddr).To4()
 		remotePort := s.cfg.EpDGPort
 		if remotePort == 0 {
 			remotePort = 500
 		}
-		if ep, ok := s.socket.(interface {
-			LocalIP() net.IP
-			RemoteIP() net.IP
-			RemotePort() int
-		}); ok {
-			if rip := ep.RemoteIP(); rip != nil {
-				if v4 := rip.To4(); v4 != nil {
-					remoteIP = v4
-				}
+		if rip := s.socket.RemoteIP(); rip != nil {
+			if v4 := rip.To4(); v4 != nil {
+				remoteIP = v4
 			}
-			if rp := ep.RemotePort(); rp != 0 {
-				remotePort = uint16(rp)
-			}
+		}
+		if rp := s.socket.RemotePort(); rp != 0 {
+			remotePort = uint16(rp)
 		}
 
 		localIP := net.ParseIP(s.cfg.LocalAddr).To4()
-		if ep, ok := s.socket.(interface{ LocalIP() net.IP }); ok {
-			if lip := ep.LocalIP(); lip != nil {
-				if v4 := lip.To4(); v4 != nil && !v4.Equal(net.IPv4zero) {
-					localIP = v4
-				}
+		if lip := s.socket.LocalIP(); lip != nil {
+			if v4 := lip.To4(); v4 != nil && !v4.Equal(net.IPv4zero) {
+				localIP = v4
 			}
 		}
 		if localIP == nil || localIP.Equal(net.IPv4zero) {
@@ -383,9 +363,7 @@ func (s *Session) handleIKESAInitResp(data []byte) error {
 		natDetected := !bytes.Equal(natSrc, expNatSrc) || !bytes.Equal(natDst, expNatDst)
 		s.natDetected = natDetected
 		if natDetected {
-			if setter, ok := s.socket.(interface{ SetRemotePort(int) }); ok {
-				setter.SetRemotePort(4500)
-			}
+			s.socket.SetRemotePort(4500)
 			s.Logger.Debug("检测到 NAT，切换到 UDP 4500；NAT keepalive 将在隧道建立后启动")
 		}
 	}

@@ -33,3 +33,4 @@ Thumbs.db
 
 # Debug
 __debug_bin*
+pkg/swu/._session.go

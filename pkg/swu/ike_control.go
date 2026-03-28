@@ -218,17 +218,15 @@ func (s *Session) handleIncomingInformational(data []byte) error {
 				if s.mobikeSupported {
 					// 用报文实际来源更新内核 SA/SP
 					if s.xfrmMgr != nil {
-						if sm, ok := s.socket.(*ipsec.SocketManager); ok {
-							newRemoteIP := sm.RemoteIP()
-							newLocalIP := sm.LocalIP()
-							if newRemoteIP != nil && newLocalIP != nil {
-								if err := s.updateXFRMState(newLocalIP.String(), newRemoteIP.String()); err != nil {
-									s.Logger.Warn("UPDATE_SA_ADDRESSES: 更新 XFRM 失败", logger.Err(err))
-								} else {
-									s.Logger.Info("UPDATE_SA_ADDRESSES: XFRM 已更新",
-										logger.String("localIP", newLocalIP.String()),
-										logger.String("remoteIP", newRemoteIP.String()))
-								}
+						newRemoteIP := s.socket.RemoteIP()
+						newLocalIP := s.socket.LocalIP()
+						if newRemoteIP != nil && newLocalIP != nil {
+							if err := s.updateXFRMState(newLocalIP.String(), newRemoteIP.String()); err != nil {
+								s.Logger.Warn("UPDATE_SA_ADDRESSES: 更新 XFRM 失败", logger.Err(err))
+							} else {
+								s.Logger.Info("UPDATE_SA_ADDRESSES: XFRM 已更新",
+									logger.String("localIP", newLocalIP.String()),
+									logger.String("remoteIP", newRemoteIP.String()))
 							}
 						}
 					}

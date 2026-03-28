@@ -359,6 +359,19 @@ func (s *Session) connectOnce() error {
 
 	if s.cfg.TransportFactory != nil {
 		s.socket, err = s.cfg.TransportFactory(localBind, remoteAddr)
+	} else if s.cfg.Socks5Addr != "" {
+		// Socks5 前置代理模式：通过 Socks5 UDP Associate 转发所有 IKE/ESP 流量
+		s.Logger.Info("使用 Socks5 前置代理连接 ePDG",
+			logger.String("proxy", s.cfg.Socks5Addr),
+			logger.String("remote", remoteAddr))
+		s.socket, err = ipsec.NewSocks5Transport(ipsec.Socks5Config{
+			ProxyAddr:  s.cfg.Socks5Addr,
+			Username:   s.cfg.Socks5Username,
+			Password:   s.cfg.Socks5Password,
+			RemoteAddr: remoteAddr,
+			DNSServer:  s.cfg.DNSServer,
+			DeviceID:   s.cfg.DeviceID,
+		})
 	} else {
 		s.socket, err = ipsec.NewSocketManager(s.cfg.DeviceID, localBind, remoteAddr, s.cfg.DNSServer)
 		if err != nil && localPort != 0 {
@@ -388,16 +401,9 @@ func (s *Session) connectOnce() error {
 	// 在发出第一包前，必须启动 IKE_Control 接收器，否则并发抛射出的响应无法解锁
 	s.ensureIKEDispatcher()
 
-	if sm, ok := s.socket.(interface {
-		LocalAddrString() string
-		RemoteAddrString() string
-	}); ok {
-		s.Logger.Debug("正在连接到 ePDG",
-			logger.String("remote", sm.RemoteAddrString()),
-			logger.String("local", sm.LocalAddrString()))
-	} else {
-		s.Logger.Debug("正在连接到 ePDG", logger.String("addr", s.cfg.EpDGAddr))
-	}
+	s.Logger.Debug("正在连接到 ePDG",
+		logger.String("remote", s.socket.RemoteAddrString()),
+		logger.String("local", s.socket.LocalAddrString()))
 
 	go s.logSessionStats(60 * time.Second)
 

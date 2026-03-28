@@ -102,19 +102,17 @@ func (s *Session) sendMOBIKEUpdate() ([]byte, error) {
 	}
 
 	// NAT Detection 载荷 (RFC 4555 §3.5 强制要求)
-	if sm, ok := s.socket.(*ipsec.SocketManager); ok {
-		localIP := sm.LocalIP()
-		remoteIP := sm.RemoteIP()
-		localPort := sm.LocalPort()
-		remotePort := uint16(sm.RemotePort())
-		if localIP != nil && remoteIP != nil {
-			srcHash := ikev2.CalculateNATDetectionHash(s.SPIi, s.SPIr, localIP, localPort)
-			dstHash := ikev2.CalculateNATDetectionHash(s.SPIi, s.SPIr, remoteIP, remotePort)
-			payloads = append(payloads,
-				ikev2.CreateNATDetectionNotify(ikev2.NAT_DETECTION_SOURCE_IP, srcHash),
-				ikev2.CreateNATDetectionNotify(ikev2.NAT_DETECTION_DESTINATION_IP, dstHash),
-			)
-		}
+	localIP := s.socket.LocalIP()
+	remoteIP := s.socket.RemoteIP()
+	localPort := s.socket.LocalPort()
+	remotePort := uint16(s.socket.RemotePort())
+	if localIP != nil && remoteIP != nil {
+		srcHash := ikev2.CalculateNATDetectionHash(s.SPIi, s.SPIr, localIP, localPort)
+		dstHash := ikev2.CalculateNATDetectionHash(s.SPIi, s.SPIr, remoteIP, remotePort)
+		payloads = append(payloads,
+			ikev2.CreateNATDetectionNotify(ikev2.NAT_DETECTION_SOURCE_IP, srcHash),
+			ikev2.CreateNATDetectionNotify(ikev2.NAT_DETECTION_DESTINATION_IP, dstHash),
+		)
 	}
 
 	// 发送 INFORMATIONAL 并等待响应
@@ -179,15 +177,13 @@ func (s *Session) updateXFRMState(localAddr, remoteAddr string) error {
 	}
 
 	var lPort, rPort int
-	if sm, ok := s.socket.(*ipsec.SocketManager); ok {
-		lPort = int(sm.LocalPort())
-		rPort = sm.RemotePort()
-		if sm.LocalIP() != nil {
-			lIP = sm.LocalIP()
-		}
-		if sm.RemoteIP() != nil {
-			rIP = sm.RemoteIP()
-		}
+	lPort = int(s.socket.LocalPort())
+	rPort = s.socket.RemotePort()
+	if s.socket.LocalIP() != nil {
+		lIP = s.socket.LocalIP()
+	}
+	if s.socket.RemoteIP() != nil {
+		rIP = s.socket.RemoteIP()
 	}
 
 	isAEAD := driver.IsAEADAlgorithm(s.childEncrID)
